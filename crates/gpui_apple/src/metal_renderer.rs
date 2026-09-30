@@ -1090,10 +1090,8 @@ impl MetalRenderer {
         encoder.end_encoding();
     }
 
-    /// Blurs a source with a dual Kawase blur and returns the full size target holding the result.
-    ///
-    /// The source is halved once per level and grown back through the same targets, each up pass
-    /// overwriting the level the down pass left behind, since nothing reads that any more.
+    /// Blurs a source with a dual Kawase blur and returns the target holding the result, at
+    /// the level [`Kawase::settled`] names. Whatever samples it stretches it back to full size.
     fn blur_source<'a>(
         &self,
         targets: &'a FilterTargets,
@@ -1131,20 +1129,16 @@ impl MetalRenderer {
             );
             from = to;
         }
-        for level in (0..kawase.levels.max(1)).rev() {
-            let to: &metal::TextureRef = &targets.levels[level];
-            self.filter_pass(
-                command_buffer,
-                &self.kawase_up_pipeline_state,
-                from,
-                to,
-                Some(&params),
-                within(level),
-            );
-            from = to;
-        }
-
-        &targets.levels[0]
+        let settled: &metal::TextureRef = &targets.levels[kawase.settled];
+        self.filter_pass(
+            command_buffer,
+            &self.kawase_up_pipeline_state,
+            from,
+            settled,
+            Some(&params),
+            within(kawase.settled),
+        );
+        settled
     }
 
     /// Draws a filtered layer back into its parent, clipped to the layer's bounds.

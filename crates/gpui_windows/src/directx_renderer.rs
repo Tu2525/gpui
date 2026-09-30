@@ -479,10 +479,8 @@ impl DirectXRenderer {
         Ok(())
     }
 
-    /// Blurs a source with a dual Kawase blur and returns the full size target holding the result.
-    ///
-    /// The source is halved once per level and grown back through the same targets, each up pass
-    /// overwriting the level the down pass left behind, since nothing reads that any more.
+    /// Blurs a source with a dual Kawase blur and returns the target holding the result, at
+    /// the level [`Kawase::settled`] names. Whatever samples it stretches it back to full size.
     fn blur_source(
         &mut self,
         source: Option<ID3D11ShaderResourceView>,
@@ -494,9 +492,10 @@ impl DirectXRenderer {
             offset: kawase.offset,
             ..Default::default()
         };
-        // Every pass covers the clip grown by what all the passes together read, which is at
-        // least what the ones after it still need. A texel more keeps the bilinear taps on the
-        // clip's own edge off texels nothing has written.
+        // Every pass covers the clip grown by what all the passes together read. The targets are
+        // never cleared, so a pass reads stale texels past the edge of what the one before it
+        // wrote, but they only creep inwards by what the later passes read, which this margin
+        // already holds. A texel more keeps the final bilinear sample on the clip's edge clean.
         let reach = kawase.reach();
         let region = |renderer: &Self, level: usize| match clip {
             Some(clip) => {
@@ -511,14 +510,12 @@ impl DirectXRenderer {
             let within = region(self, level)?;
             from = self.filter_pass(Pass::KawaseDown, from, level, Some(params), within)?;
         }
-        for level in (0..kawase.levels.max(1)).rev() {
-            let within = region(self, level)?;
-            from = self.filter_pass(Pass::KawaseUp, from, level, Some(params), within)?;
-        }
-        Ok(from)
+        let within = region(self, kawase.settled)?;
+        self.filter_pass(Pass::KawaseUp, from, kawase.settled, Some(params), within)
     }
 
-    /// Draws one full-screen pass of a filter into a blur level, returning what it wrote.
+    /// Draws one full-screen pass of a filter into a blur level, returning what it wrote. The
+    /// target is not cleared first, since the pass writes every texel it covers.
     fn filter_pass(
         &mut self,
         pass: Pass,
@@ -549,9 +546,6 @@ impl DirectXRenderer {
         unsafe {
             device_context.OMSetRenderTargets(Some(slice::from_ref(&view)), None);
             device_context.RSSetViewports(Some(slice::from_ref(&viewport)));
-            if let Some(view) = view.as_ref() {
-                device_context.ClearRenderTargetView(view, &[0.0f32; 4]);
-            }
         }
         match within {
             Some(within) => self.set_scissor(within),

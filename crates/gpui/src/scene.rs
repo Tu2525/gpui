@@ -433,17 +433,18 @@ pub struct Filter {
     pub translate: Point<ScaledPixels>,
 }
 
-/// How many times a dual Kawase blur can halve the image before it grows it back. Every level
-/// doubles the radius, so six reach a little past a hundred scaled pixels.
+/// How many times a dual Kawase blur can halve the image. Every level doubles the radius, so six
+/// reach close to a hundred scaled pixels.
 pub const KAWASE_LEVELS: usize = 6;
 
 /// The distance between the offsets [`KAWASE_SPREAD`] was measured at.
 const KAWASE_STEP: f32 = 0.25;
 
 /// The standard deviation a dual Kawase blur spreads a point to, divided by `2^levels`, measured
-/// at offsets of `0, 0.25, 0.5, ...`. Rows are the level counts `0` to `3`, and the last row
-/// serves every deeper count, since the ratio stops moving by then. Each row ends where its
-/// kernel would go hollow in the middle and show the blurred shape twice.
+/// at offsets of `0, 0.25, 0.5, ...` with the one up pass and the bilinear stretch the blur ends
+/// on. Rows are the level counts `0` to `3`, and the last row serves every deeper count, since
+/// the ratio stops moving by then. Each row ends where its kernel would go hollow in the middle
+/// and show the blurred shape twice.
 const KAWASE_SPREAD: [&[f32]; 5] = [
     &[0.0, 0.25, 0.354, 0.433, 0.5, 0.559, 0.612, 0.661, 0.707],
     &[
@@ -451,36 +452,39 @@ const KAWASE_SPREAD: [&[f32]; 5] = [
         1.184, 1.275, 1.356, 1.422,
     ],
     &[
-        0.484, 0.484, 0.484, 0.51, 0.535, 0.676, 0.774, 0.866, 0.941, 1.007, 1.066, 1.133, 1.196,
-        1.32, 1.425, 1.524, 1.609,
+        0.484, 0.484, 0.484, 0.505, 0.525, 0.651, 0.741, 0.825, 0.896, 0.958, 1.015, 1.077, 1.136,
+        1.242, 1.335, 1.423, 1.502,
     ],
     &[
-        0.496, 0.496, 0.496, 0.523, 0.548, 0.701, 0.799, 0.889, 0.964, 1.032, 1.096, 1.169, 1.238,
-        1.357, 1.46, 1.562, 1.652,
+        0.48, 0.48, 0.48, 0.501, 0.522, 0.659, 0.749, 0.831, 0.9, 0.962, 1.02, 1.085, 1.145, 1.251,
+        1.343, 1.434, 1.516,
     ],
     &[
-        0.499, 0.499, 0.499, 0.526, 0.552, 0.708, 0.805, 0.893, 0.97, 1.04, 1.107, 1.183, 1.255,
-        1.367, 1.469, 1.571, 1.663,
+        0.479, 0.479, 0.479, 0.5, 0.521, 0.667, 0.756, 0.835, 0.901, 0.962, 1.02, 1.085, 1.148,
+        1.253, 1.346, 1.437, 1.52,
     ],
 ];
 
-/// The passes of a dual Kawase blur. It halves the image `levels` times with a five tap filter
-/// and grows it back with an eight tap one, so its cost barely grows with the radius.
+/// The passes of a dual Kawase blur. It halves the image `levels` times with a five tap filter and
+/// grows it back one level with an eight tap one, leaving the rest of the way to the bilinear
+/// sample that composites it, so its cost barely grows with the radius.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Kawase {
-    /// How many times the image is halved and grown back. Zero is a single eight tap pass at
-    /// full resolution, which keeps a small blur from going soft.
+    /// How many times the image is halved. Zero is a single eight tap pass at full resolution,
+    /// which keeps a small blur from going soft.
     pub levels: usize,
     /// How far the taps spread. A down pass puts its corner taps this many half texels out in
     /// the texture it reads, and an up pass this many quarter texels out, which keeps its ring of
     /// taps from going hollow.
     pub offset: f32,
+    /// The level the blur ends on, one above the deepest, which the caller samples it from.
+    pub settled: usize,
 }
 
 impl Kawase {
     /// The passes that spread a point as far as a gaussian of standard deviation `sigma`, in
-    /// scaled pixels. It takes the fewest levels that reach, since every level costs a pass each
-    /// way, and a radius past the deepest level is capped there.
+    /// scaled pixels. It takes the fewest levels that reach, since every level costs a pass, and a
+    /// radius past the deepest level is capped there.
     pub fn for_sigma(sigma: f32) -> Self {
         let sigma = sigma.max(0.);
         let mut levels = 0;
@@ -502,6 +506,7 @@ impl Kawase {
                 return Self {
                     levels,
                     offset: step * KAWASE_STEP,
+                    settled: levels.saturating_sub(1),
                 };
             }
             levels += 1;
@@ -511,15 +516,14 @@ impl Kawase {
     /// How far the passes read past a texel, in scaled pixels of the frame, so a caller can grow
     /// the region it blurs by this much and still have every tap land on written texels.
     pub fn reach(&self) -> f32 {
-        // Both passes reach half an offset and a bilinear texel out, in the texels they read.
-        let down = self.offset * 0.5 + 1.;
-        let up = down;
+        // Every pass reaches half an offset and a bilinear texel out, in the texels it reads. The
+        // down passes read levels `0` to `levels - 1` and the up pass the deepest one, and a texel
+        // is `2^level` scaled pixels wide.
+        let tap = self.offset * 0.5 + 1.;
+        let deepest = (1u32 << self.levels) as f32;
         match self.levels {
-            0 => up,
-            levels => {
-                let scale = (1u32 << levels) as f32;
-                down * (scale - 1.) + up * (scale * 2. - 2.)
-            }
+            0 => tap,
+            _ => tap * (deepest * 2. - 1.),
         }
     }
 }

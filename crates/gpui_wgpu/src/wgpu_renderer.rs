@@ -1385,10 +1385,8 @@ impl WgpuRenderer {
         pass.set_scissor_rect(0, 0, self.surface_config.width, self.surface_config.height);
     }
 
-    /// Blurs a source with a dual Kawase blur and returns the full size target holding the result.
-    ///
-    /// The source is halved once per level and grown back through the same targets, each up pass
-    /// overwriting the level the down pass left behind, since nothing reads that any more.
+    /// Blurs a source with a dual Kawase blur and returns the target holding the result, at
+    /// the level [`Kawase::settled`] names. Whatever samples it stretches it back to full size.
     fn blur_source(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -1410,9 +1408,10 @@ impl WgpuRenderer {
         let down = self.resources().pipelines.kawase_down.clone();
         let up = self.resources().pipelines.kawase_up.clone();
 
-        // Every pass covers the clip grown by what all the passes together read, which is at
-        // least what the ones after it still need. A texel more keeps the bilinear taps on the
-        // clip's own edge off texels nothing has written.
+        // Every pass covers the clip grown by what all the passes together read. The targets are
+        // never cleared, so a pass reads stale texels past the edge of what the one before it
+        // wrote, but they only creep inwards by what the later passes read, which this margin
+        // already holds. A texel more keeps the final bilinear sample on the clip's edge clean.
         let reach = kawase.reach();
         let within = |level: usize| {
             let shrink = 1u32 << level;
@@ -1433,14 +1432,21 @@ impl WgpuRenderer {
             );
             from = to;
         }
-        for level in (0..kawase.levels.max(1)).rev() {
-            let to = &views.levels[level];
-            self.fullscreen_pass(encoder, "kawase_up", &up, from, to, &params, within(level));
-            from = to;
-        }
-        Ok(views.levels[0].clone())
+        let settled = &views.levels[kawase.settled];
+        self.fullscreen_pass(
+            encoder,
+            "kawase_up",
+            &up,
+            from,
+            settled,
+            &params,
+            within(kawase.settled),
+        );
+        Ok(settled.clone())
     }
 
+    /// Draws one full-screen pass from `source` into `target`, within `within` when it is given.
+    /// The target is loaded rather than cleared, since the pass writes every texel it covers.
     fn fullscreen_pass(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -1458,7 +1464,7 @@ impl WgpuRenderer {
                 view: target,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
                 },
                 depth_slice: None,
