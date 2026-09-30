@@ -1377,28 +1377,49 @@ fragment float4 backdrop_punch_fragment(
   return float4(0.0, 0.0, 0.0, coverage * backdrop.opacity);
 }
 
-fragment float4 blur_fragment(
+// A dual Kawase blur: `kawase_down_fragment` halves the image with five taps and
+// `kawase_up_fragment` grows it back with eight. The down pass takes the offset in half texels
+// of what it reads and the up pass in quarter texels, which keeps its ring of taps from going
+// hollow.
+fragment float4 kawase_down_fragment(
     FilterFragmentInput input [[stage_in]],
     constant BlurParams *params [[buffer(FilterInputIndex_Params)]],
     texture2d<float> source [[texture(FilterInputIndex_Source)]]) {
   constexpr sampler source_sampler(mag_filter::linear, min_filter::linear,
                                    address::clamp_to_edge);
-  float2 texel = 1.0 / float2(source.get_width(), source.get_height());
-  float2 step = float2(params->direction_x, params->direction_y) * texel;
-  float sigma = max(params->sigma, 0.0001);
-  float reach = min(ceil(sigma * 3.0), 24.0);
-  float spread = 2.0 * sigma * sigma;
+  float2 half_step =
+      0.5 * params->offset / float2(source.get_width(), source.get_height());
+  float2 flipped = float2(half_step.x, -half_step.y);
 
-  float4 total = source.sample(source_sampler, input.uv);
-  float weight = 1.0;
-  for (float offset = 1.0; offset <= reach; offset += 1.0) {
-    float tap = exp(-offset * offset / spread);
-    total += tap * source.sample(source_sampler, input.uv + step * offset);
-    total += tap * source.sample(source_sampler, input.uv - step * offset);
-    weight += tap * 2.0;
-  }
+  float4 total = source.sample(source_sampler, input.uv) * 4.0;
+  total += source.sample(source_sampler, input.uv - half_step);
+  total += source.sample(source_sampler, input.uv + half_step);
+  total += source.sample(source_sampler, input.uv - flipped);
+  total += source.sample(source_sampler, input.uv + flipped);
+  return total / 8.0;
+}
 
-  return total / weight;
+fragment float4 kawase_up_fragment(
+    FilterFragmentInput input [[stage_in]],
+    constant BlurParams *params [[buffer(FilterInputIndex_Params)]],
+    texture2d<float> source [[texture(FilterInputIndex_Source)]]) {
+  constexpr sampler source_sampler(mag_filter::linear, min_filter::linear,
+                                   address::clamp_to_edge);
+  float2 half_step =
+      0.25 * params->offset / float2(source.get_width(), source.get_height());
+  float2 flipped = float2(half_step.x, -half_step.y);
+  float2 across = float2(half_step.x * 2.0, 0.0);
+  float2 down = float2(0.0, half_step.y * 2.0);
+
+  float4 total = source.sample(source_sampler, input.uv + across);
+  total += source.sample(source_sampler, input.uv - across);
+  total += source.sample(source_sampler, input.uv + down);
+  total += source.sample(source_sampler, input.uv - down);
+  total += source.sample(source_sampler, input.uv + half_step) * 2.0;
+  total += source.sample(source_sampler, input.uv - half_step) * 2.0;
+  total += source.sample(source_sampler, input.uv + flipped) * 2.0;
+  total += source.sample(source_sampler, input.uv - flipped) * 2.0;
+  return total / 12.0;
 }
 
 fragment float4 blit_fragment(

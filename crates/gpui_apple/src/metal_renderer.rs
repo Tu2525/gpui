@@ -7,8 +7,8 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, LayerEffect, PaintSurface, Path,
-    Point, PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
+    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, KAWASE_LEVELS, Kawase,
+    LayerEffect, PaintSurface, Path, Point, PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -40,11 +40,6 @@ const PATH_SAMPLE_COUNT: u32 = 4;
 /// Metal requires the offset a buffer is bound at to be 256-byte aligned.
 const INSTANCE_BUFFER_ALIGNMENT: usize = 256;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
-/// The resolutions a blur can run at, as divisors of the frame. A radius picks the first step it
-/// fits within, so small blurs keep every pixel and wide ones stay cheap.
-const BLUR_STEPS: [u32; 3] = [1, 2, 4];
-/// A gaussian is cut off after three standard deviations.
-const BLUR_REACH: f32 = 4.;
 /// How deeply filtered layers can nest before the innermost ones stop being filtered.
 const LAYER_DEPTH: usize = 4;
 
@@ -135,7 +130,8 @@ pub struct MetalRenderer {
     surfaces_pipeline_state: metal::RenderPipelineState,
     backdrops_pipeline_state: metal::RenderPipelineState,
     backdrop_punch_pipeline_state: metal::RenderPipelineState,
-    blur_pipeline_state: metal::RenderPipelineState,
+    kawase_down_pipeline_state: metal::RenderPipelineState,
+    kawase_up_pipeline_state: metal::RenderPipelineState,
     blit_pipeline_state: metal::RenderPipelineState,
     composite_pipeline_state: metal::RenderPipelineState,
     masked_pipeline_state: metal::RenderPipelineState,
@@ -359,12 +355,21 @@ impl MetalRenderer {
             MTLPixelFormat::BGRA8Unorm,
             FilterBlend::Punch,
         );
-        let blur_pipeline_state = build_filter_pipeline_state(
+        let kawase_down_pipeline_state = build_filter_pipeline_state(
             &device,
             &library,
-            "blur",
+            "kawase_down",
             "filter_vertex",
-            "blur_fragment",
+            "kawase_down_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+            FilterBlend::Replace,
+        );
+        let kawase_up_pipeline_state = build_filter_pipeline_state(
+            &device,
+            &library,
+            "kawase_up",
+            "filter_vertex",
+            "kawase_up_fragment",
             MTLPixelFormat::BGRA8Unorm,
             FilterBlend::Replace,
         );
@@ -419,7 +424,8 @@ impl MetalRenderer {
             surfaces_pipeline_state,
             backdrops_pipeline_state,
             backdrop_punch_pipeline_state,
-            blur_pipeline_state,
+            kawase_down_pipeline_state,
+            kawase_up_pipeline_state,
             blit_pipeline_state,
             composite_pipeline_state,
             masked_pipeline_state,
@@ -1008,15 +1014,8 @@ impl MetalRenderer {
                 size: viewport_size,
                 frame: target(width, height),
                 layers: (0..LAYER_DEPTH).map(|_| target(width, height)).collect(),
-                steps: BLUR_STEPS
-                    .iter()
-                    .map(|shrink| {
-                        let shrink = *shrink as u64;
-                        [
-                            target(width / shrink, height / shrink),
-                            target(width / shrink, height / shrink),
-                        ]
-                    })
+                levels: (0..=KAWASE_LEVELS)
+                    .map(|level| target(width >> level, height >> level))
                     .collect(),
             });
         }
@@ -1091,10 +1090,10 @@ impl MetalRenderer {
         encoder.end_encoding();
     }
 
-    /// Blurs a source into one of the ping-pong targets and returns the one holding the result.
+    /// Blurs a source with a dual Kawase blur and returns the full size target holding the result.
     ///
-    /// The resolution follows the radius: a small blur stays at full resolution, where downsampling
-    /// would turn text into mush, and only a wide one is worth shrinking first.
+    /// The source is halved once per level and grown back through the same targets, each up pass
+    /// overwriting the level the down pass left behind, since nothing reads that any more.
     fn blur_source<'a>(
         &self,
         targets: &'a FilterTargets,
@@ -1104,66 +1103,48 @@ impl MetalRenderer {
         clip: Option<Bounds<ScaledPixels>>,
         viewport_size: Size<DevicePixels>,
     ) -> &'a metal::TextureRef {
-        let step = BLUR_STEPS
-            .iter()
-            .position(|shrink| sigma <= BLUR_REACH * *shrink as f32)
-            .unwrap_or(BLUR_STEPS.len() - 1);
-        let shrink = BLUR_STEPS[step] as f32;
-        let across = BlurParams {
-            direction_x: 1.,
-            direction_y: 0.,
-            sigma: sigma / shrink,
-            pad: 0.,
+        let kawase = Kawase::for_sigma(sigma);
+        let params = BlurParams {
+            offset: kawase.offset,
+            pad: [0.; 3],
         };
-        let down = BlurParams {
-            direction_x: 0.,
-            direction_y: 1.,
-            sigma: sigma / shrink,
-            pad: 0.,
-        };
-        // Each pass reads a kernel's width beyond what the next one needs, so the region grows
-        // from the composited clip outwards. Every one reaches a texel further still: the
-        // blurred texture is sampled at full resolution, so a fragment on the clip's own edge
-        // draws part of its colour from the texel outside it, which nothing has written.
-        let within = |margin: f32, shrink: u32| {
-            let reach = ScaledPixels(margin + shrink as f32);
-            clip.and_then(|clip| Self::scissor(clip.dilate(reach), viewport_size, shrink))
+        // Every pass covers the clip grown by what all the passes together read, which is at
+        // least what the ones after it still need. A texel more keeps the bilinear taps on the
+        // clip's own edge off texels nothing has written.
+        let reach = kawase.reach();
+        let within = |level: usize| {
+            let shrink = 1u32 << level;
+            let grown = ScaledPixels(reach + shrink as f32);
+            clip.and_then(|clip| Self::scissor(clip.dilate(grown), viewport_size, shrink))
         };
 
         let mut from = source;
-        for shrunk in 0..step {
-            let shrink = BLUR_STEPS[shrunk + 1];
+        for level in 1..=kawase.levels {
+            let to: &metal::TextureRef = &targets.levels[level];
             self.filter_pass(
                 command_buffer,
-                &self.blit_pipeline_state,
+                &self.kawase_down_pipeline_state,
                 from,
-                &targets.steps[shrunk + 1][0],
-                None,
-                within(sigma * BLUR_REACH * 2., shrink),
+                to,
+                Some(&params),
+                within(level),
             );
-            from = &targets.steps[shrunk + 1][0];
+            from = to;
+        }
+        for level in (0..kawase.levels.max(1)).rev() {
+            let to: &metal::TextureRef = &targets.levels[level];
+            self.filter_pass(
+                command_buffer,
+                &self.kawase_up_pipeline_state,
+                from,
+                to,
+                Some(&params),
+                within(level),
+            );
+            from = to;
         }
 
-        let shrink = BLUR_STEPS[step];
-        let [held, scratch] = &targets.steps[step];
-        self.filter_pass(
-            command_buffer,
-            &self.blur_pipeline_state,
-            from,
-            scratch,
-            Some(&across),
-            within(sigma * BLUR_REACH, shrink),
-        );
-        self.filter_pass(
-            command_buffer,
-            &self.blur_pipeline_state,
-            scratch,
-            held,
-            Some(&down),
-            within(0., shrink),
-        );
-
-        held
+        &targets.levels[0]
     }
 
     /// Draws a filtered layer back into its parent, clipped to the layer's bounds.
@@ -1812,17 +1793,16 @@ struct FilterTargets {
     size: Size<DevicePixels>,
     frame: metal::Texture,
     layers: Vec<metal::Texture>,
-    /// Ping-pong pairs for the blur passes, one per resolution step.
-    steps: Vec<[metal::Texture; 2]>,
+    /// One target per blur level, the frame's size halved as many times as its index. Level zero
+    /// holds the finished blur.
+    levels: Vec<metal::Texture>,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct BlurParams {
-    pub direction_x: f32,
-    pub direction_y: f32,
-    pub sigma: f32,
-    pub pad: f32,
+    pub offset: f32,
+    pub pad: [f32; 3],
 }
 
 #[repr(C)]

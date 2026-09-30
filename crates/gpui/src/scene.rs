@@ -433,6 +433,97 @@ pub struct Filter {
     pub translate: Point<ScaledPixels>,
 }
 
+/// How many times a dual Kawase blur can halve the image before it grows it back. Every level
+/// doubles the radius, so six reach a little past a hundred scaled pixels.
+pub const KAWASE_LEVELS: usize = 6;
+
+/// The distance between the offsets [`KAWASE_SPREAD`] was measured at.
+const KAWASE_STEP: f32 = 0.25;
+
+/// The standard deviation a dual Kawase blur spreads a point to, divided by `2^levels`, measured
+/// at offsets of `0, 0.25, 0.5, ...`. Rows are the level counts `0` to `3`, and the last row
+/// serves every deeper count, since the ratio stops moving by then. Each row ends where its
+/// kernel would go hollow in the middle and show the blurred shape twice.
+const KAWASE_SPREAD: [&[f32]; 5] = [
+    &[0.0, 0.25, 0.354, 0.433, 0.5, 0.559, 0.612, 0.661, 0.707],
+    &[
+        0.433, 0.433, 0.433, 0.456, 0.479, 0.592, 0.681, 0.768, 0.842, 0.905, 0.96, 1.019, 1.07,
+        1.184, 1.275, 1.356, 1.422,
+    ],
+    &[
+        0.484, 0.484, 0.484, 0.51, 0.535, 0.676, 0.774, 0.866, 0.941, 1.007, 1.066, 1.133, 1.196,
+        1.32, 1.425, 1.524, 1.609,
+    ],
+    &[
+        0.496, 0.496, 0.496, 0.523, 0.548, 0.701, 0.799, 0.889, 0.964, 1.032, 1.096, 1.169, 1.238,
+        1.357, 1.46, 1.562, 1.652,
+    ],
+    &[
+        0.499, 0.499, 0.499, 0.526, 0.552, 0.708, 0.805, 0.893, 0.97, 1.04, 1.107, 1.183, 1.255,
+        1.367, 1.469, 1.571, 1.663,
+    ],
+];
+
+/// The passes of a dual Kawase blur. It halves the image `levels` times with a five tap filter
+/// and grows it back with an eight tap one, so its cost barely grows with the radius.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Kawase {
+    /// How many times the image is halved and grown back. Zero is a single eight tap pass at
+    /// full resolution, which keeps a small blur from going soft.
+    pub levels: usize,
+    /// How far the taps spread. A down pass puts its corner taps this many half texels out in
+    /// the texture it reads, and an up pass this many quarter texels out, which keeps its ring of
+    /// taps from going hollow.
+    pub offset: f32,
+}
+
+impl Kawase {
+    /// The passes that spread a point as far as a gaussian of standard deviation `sigma`, in
+    /// scaled pixels. It takes the fewest levels that reach, since every level costs a pass each
+    /// way, and a radius past the deepest level is capped there.
+    pub fn for_sigma(sigma: f32) -> Self {
+        let sigma = sigma.max(0.);
+        let mut levels = 0;
+        loop {
+            let spread = KAWASE_SPREAD[levels.min(KAWASE_SPREAD.len() - 1)];
+            let scale = (1u32 << levels) as f32;
+            let widest = spread[spread.len() - 1] * scale;
+            if sigma <= widest || levels == KAWASE_LEVELS {
+                let target = sigma / scale;
+                let above = spread.partition_point(|&spread| spread < target);
+                let step = match above {
+                    0 => 0.,
+                    above if above == spread.len() => (spread.len() - 1) as f32,
+                    above => {
+                        let (low, high) = (spread[above - 1], spread[above]);
+                        (above - 1) as f32 + (target - low) / (high - low)
+                    }
+                };
+                return Self {
+                    levels,
+                    offset: step * KAWASE_STEP,
+                };
+            }
+            levels += 1;
+        }
+    }
+
+    /// How far the passes read past a texel, in scaled pixels of the frame, so a caller can grow
+    /// the region it blurs by this much and still have every tap land on written texels.
+    pub fn reach(&self) -> f32 {
+        // Both passes reach half an offset and a bilinear texel out, in the texels they read.
+        let down = self.offset * 0.5 + 1.;
+        let up = down;
+        match self.levels {
+            0 => up,
+            levels => {
+                let scale = (1u32 << levels) as f32;
+                down * (scale - 1.) + up * (scale * 2. - 2.)
+            }
+        }
+    }
+}
+
 impl Default for Filter {
     fn default() -> Self {
         Self {

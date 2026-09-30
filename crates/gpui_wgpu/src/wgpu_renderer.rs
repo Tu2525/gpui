@@ -2,8 +2,8 @@ use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, LayerEffect, Path, Point,
-    PrimitiveBatch, ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, KAWASE_LEVELS, Kawase, LayerEffect,
+    Path, Point, PrimitiveBatch, ScaledPixels, Scene, Size, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -124,7 +124,8 @@ pub struct WgpuSurfaceConfig {
 struct WgpuPipelines {
     backdrops: wgpu::RenderPipeline,
     backdrop_punch: wgpu::RenderPipeline,
-    blur: wgpu::RenderPipeline,
+    kawase_down: wgpu::RenderPipeline,
+    kawase_up: wgpu::RenderPipeline,
     blit: wgpu::RenderPipeline,
     composite: wgpu::RenderPipeline,
     masked: wgpu::RenderPipeline,
@@ -210,7 +211,7 @@ struct WgpuResources {
 struct BackdropViews {
     frame: wgpu::TextureView,
     layers: Vec<wgpu::TextureView>,
-    steps: Vec<[wgpu::TextureView; 2]>,
+    levels: Vec<wgpu::TextureView>,
 }
 
 #[repr(C, align(8))]
@@ -231,17 +232,9 @@ struct MaskParams {
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct BlurParams {
-    direction: [f32; 2],
-    sigma: f32,
-    pad: u32,
+    offset: f32,
+    pad: [u32; 3],
 }
-
-/// The resolutions a blur can run at, as divisors of the frame. A radius picks the first step it
-/// fits within, so small blurs keep every pixel and wide ones stay cheap.
-const BLUR_STEPS: [u32; 3] = [1, 2, 4];
-
-/// A gaussian is cut off after three standard deviations.
-const BLUR_REACH: f32 = 4.;
 
 /// How deeply filtered layers can nest before the innermost ones stop being filtered.
 const LAYER_DEPTH: usize = 4;
@@ -251,20 +244,16 @@ struct BackdropTargets {
     frame: wgpu::Texture,
     frame_view: wgpu::TextureView,
     layers: Vec<(wgpu::Texture, wgpu::TextureView)>,
-    /// Ping-pong pairs for the blur passes, one per resolution step.
-    steps: Vec<[(wgpu::Texture, wgpu::TextureView); 2]>,
+    /// One target per blur level, the frame's size halved as many times as its index. Level zero
+    /// holds the finished blur.
+    levels: Vec<(wgpu::Texture, wgpu::TextureView)>,
 }
 
 impl BackdropTargets {
     fn drop_textures(&self) {
         self.frame.destroy();
-        for (texture, _) in &self.layers {
+        for (texture, _) in self.layers.iter().chain(&self.levels) {
             texture.destroy();
-        }
-        for pair in &self.steps {
-            for (texture, _) in pair {
-                texture.destroy();
-            }
         }
     }
 }
@@ -1052,10 +1041,23 @@ impl WgpuRenderer {
             write_mask: wgpu::ColorWrites::ALL,
         };
 
-        let blur = create_pipeline(
-            "blur",
+        let kawase_down = create_pipeline(
+            "kawase_down",
             "vs_blur",
-            "fs_blur",
+            "fs_kawase_down",
+            &layouts.globals,
+            &layouts.instances,
+            Some(&layouts.texture),
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(opaque_target.clone())],
+            1,
+            &shader_module,
+        );
+
+        let kawase_up = create_pipeline(
+            "kawase_up",
+            "vs_blur",
+            "fs_kawase_up",
             &layouts.globals,
             &layouts.instances,
             Some(&layouts.texture),
@@ -1281,7 +1283,8 @@ impl WgpuRenderer {
         WgpuPipelines {
             backdrops,
             backdrop_punch,
-            blur,
+            kawase_down,
+            kawase_up,
             blit,
             composite,
             masked,
@@ -1382,10 +1385,10 @@ impl WgpuRenderer {
         pass.set_scissor_rect(0, 0, self.surface_config.width, self.surface_config.height);
     }
 
-    /// Blurs a source into one of the ping-pong targets and returns the one holding the result.
+    /// Blurs a source with a dual Kawase blur and returns the full size target holding the result.
     ///
-    /// The resolution follows the radius: a small blur stays at full resolution, where downsampling
-    /// would turn text into mush, and only a wide one is worth shrinking first.
+    /// The source is halved once per level and grown back through the same targets, each up pass
+    /// overwriting the level the down pass left behind, since nothing reads that any more.
     fn blur_source(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -1395,84 +1398,47 @@ impl WgpuRenderer {
         clip: Option<Bounds<ScaledPixels>>,
         instance_offset: &mut u64,
     ) -> Result<wgpu::TextureView> {
-        let step = BLUR_STEPS
-            .iter()
-            .position(|shrink| sigma <= BLUR_REACH * *shrink as f32)
-            .unwrap_or(BLUR_STEPS.len() - 1);
-        let shrink = BLUR_STEPS[step] as f32;
-
-        let plain = self.write_instance_binding(
-            "blur_blit_bind_group",
-            instance_offset,
-            &[BlurParams::default()],
-        )?;
-        let across = self.write_instance_binding(
-            "blur_across_bind_group",
+        let kawase = Kawase::for_sigma(sigma);
+        let params = self.write_instance_binding(
+            "kawase_bind_group",
             instance_offset,
             &[BlurParams {
-                direction: [1., 0.],
-                sigma: sigma / shrink,
-                pad: 0,
+                offset: kawase.offset,
+                pad: [0; 3],
             }],
         )?;
-        let down = self.write_instance_binding(
-            "blur_down_bind_group",
-            instance_offset,
-            &[BlurParams {
-                direction: [0., 1.],
-                sigma: sigma / shrink,
-                pad: 0,
-            }],
-        )?;
+        let down = self.resources().pipelines.kawase_down.clone();
+        let up = self.resources().pipelines.kawase_up.clone();
 
-        let blit = self.resources().pipelines.blit.clone();
-        let blur = self.resources().pipelines.blur.clone();
-
-        // Each pass reads a kernel's width beyond what the next one needs, so the region grows
-        // from the composited clip outwards. Every one reaches a texel further still: the
-        // blurred texture is sampled at full resolution, so a fragment on the clip's own edge
-        // draws part of its colour from the texel outside it, which nothing has written.
-        let within = |clip: Option<Bounds<ScaledPixels>>, margin: f32, shrink: u32| {
-            let reach = ScaledPixels(margin + shrink as f32);
-            clip.map(|clip| self.scissor(clip.dilate(reach), shrink))
+        // Every pass covers the clip grown by what all the passes together read, which is at
+        // least what the ones after it still need. A texel more keeps the bilinear taps on the
+        // clip's own edge off texels nothing has written.
+        let reach = kawase.reach();
+        let within = |level: usize| {
+            let shrink = 1u32 << level;
+            clip.map(|clip| self.scissor(clip.dilate(ScaledPixels(reach + shrink as f32)), shrink))
         };
 
         let mut from = source;
-        for shrunk in 0..step {
-            let shrink = BLUR_STEPS[shrunk + 1];
+        for level in 1..=kawase.levels {
+            let to = &views.levels[level];
             self.fullscreen_pass(
                 encoder,
-                "blur_shrink",
-                &blit,
+                "kawase_down",
+                &down,
                 from,
-                &views.steps[shrunk + 1][0],
-                &plain,
-                within(clip, sigma * BLUR_REACH * 2., shrink),
+                to,
+                &params,
+                within(level),
             );
-            from = &views.steps[shrunk + 1][0];
+            from = to;
         }
-
-        let shrink = BLUR_STEPS[step];
-        let [held, scratch] = &views.steps[step];
-        self.fullscreen_pass(
-            encoder,
-            "blur_across",
-            &blur,
-            from,
-            scratch,
-            &across,
-            within(clip, sigma * BLUR_REACH, shrink),
-        );
-        self.fullscreen_pass(
-            encoder,
-            "blur_down",
-            &blur,
-            scratch,
-            held,
-            &down,
-            within(clip, 0., shrink),
-        );
-        Ok(held.clone())
+        for level in (0..kawase.levels.max(1)).rev() {
+            let to = &views.levels[level];
+            self.fullscreen_pass(encoder, "kawase_up", &up, from, to, &params, within(level));
+            from = to;
+        }
+        Ok(views.levels[0].clone())
     }
 
     fn fullscreen_pass(
@@ -1544,10 +1510,10 @@ impl WgpuRenderer {
                 .iter()
                 .map(|(_, view)| view.clone())
                 .collect(),
-            steps: targets
-                .steps
+            levels: targets
+                .levels
                 .iter()
-                .map(|[a, b]| [a.1.clone(), b.1.clone()])
+                .map(|(_, view)| view.clone())
                 .collect(),
         })
     }
@@ -1585,21 +1551,15 @@ impl WgpuRenderer {
         let layers = (0..LAYER_DEPTH)
             .map(|depth| target(&format!("filter_layer_{depth}"), width, height))
             .collect();
-        let steps = BLUR_STEPS
-            .iter()
-            .map(|shrink| {
-                [
-                    target(&format!("blur_{shrink}_a"), width / shrink, height / shrink),
-                    target(&format!("blur_{shrink}_b"), width / shrink, height / shrink),
-                ]
-            })
+        let levels = (0..=KAWASE_LEVELS)
+            .map(|level| target(&format!("blur_{level}"), width >> level, height >> level))
             .collect();
 
         resources.backdrop_targets = Some(BackdropTargets {
             frame,
             frame_view,
             layers,
-            steps,
+            levels,
         });
     }
 

@@ -27,11 +27,6 @@ pub(crate) const DISABLE_DIRECT_COMPOSITION: &str = "GPUI_DISABLE_DIRECT_COMPOSI
 const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 // This configuration is used for MSAA rendering on paths only, and it's guaranteed to be supported by DirectX 11.
 const PATH_MULTISAMPLE_COUNT: u32 = 4;
-/// The resolutions a blur can run at, as divisors of the frame. A radius picks the first step it
-/// fits within, so small blurs keep every pixel and wide ones stay cheap.
-const BLUR_STEPS: [u32; 3] = [1, 2, 4];
-/// A gaussian is cut off after three standard deviations.
-const BLUR_REACH: f32 = 4.;
 /// How deeply filtered layers can nest before the innermost ones stop being filtered.
 const LAYER_DEPTH: usize = 4;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
@@ -104,18 +99,17 @@ struct RenderTexture {
 struct FilterTargets {
     frame: RenderTexture,
     layers: Vec<RenderTexture>,
-    /// Ping-pong pairs for the blur passes, one per resolution step.
-    steps: Vec<[RenderTexture; 2]>,
+    /// One target per blur level, the frame's size halved as many times as its index. Level zero
+    /// holds the finished blur.
+    levels: Vec<RenderTexture>,
 }
 
 impl FilterTargets {
     fn new(device: &ID3D11Device, width: u32, height: u32) -> Result<Self> {
-        let mut steps = Vec::with_capacity(BLUR_STEPS.len());
-        for shrink in BLUR_STEPS {
-            steps.push([
-                create_render_texture(device, width / shrink, height / shrink)?,
-                create_render_texture(device, width / shrink, height / shrink)?,
-            ]);
+        let mut levels = Vec::with_capacity(KAWASE_LEVELS + 1);
+        for level in 0..=KAWASE_LEVELS {
+            let (width, height) = (width >> level, height >> level);
+            levels.push(create_render_texture(device, width, height)?);
         }
         let mut layers = Vec::with_capacity(LAYER_DEPTH);
         for _ in 0..LAYER_DEPTH {
@@ -125,7 +119,7 @@ impl FilterTargets {
         Ok(Self {
             frame: create_render_texture(device, width, height)?,
             layers,
-            steps,
+            levels,
         })
     }
 }
@@ -135,9 +129,9 @@ impl FilterTargets {
 struct FilterParams {
     source_bounds: Bounds<ScaledPixels>,
     fade_bounds: Bounds<ScaledPixels>,
-    direction: [f32; 2],
+    pad: [f32; 2],
     transform_origin: [f32; 2],
-    sigma: f32,
+    offset: f32,
     scale: f32,
     fade_top: f32,
     fade_bottom: f32,
@@ -150,9 +144,9 @@ const _: () = {
     assert!(std::mem::size_of::<FilterParams>() == 20 * std::mem::size_of::<f32>());
     assert!(std::mem::offset_of!(FilterParams, source_bounds) == 0);
     assert!(std::mem::offset_of!(FilterParams, fade_bounds) == 16);
-    assert!(std::mem::offset_of!(FilterParams, direction) == 32);
+    assert!(std::mem::offset_of!(FilterParams, pad) == 32);
     assert!(std::mem::offset_of!(FilterParams, transform_origin) == 40);
-    assert!(std::mem::offset_of!(FilterParams, sigma) == 48);
+    assert!(std::mem::offset_of!(FilterParams, offset) == 48);
     assert!(std::mem::offset_of!(FilterParams, scale) == 52);
     assert!(std::mem::offset_of!(FilterParams, fade_top) == 56);
     assert!(std::mem::offset_of!(FilterParams, fade_bottom) == 60);
@@ -163,14 +157,15 @@ const _: () = {
 
 #[derive(Clone, Copy)]
 enum Pass {
-    Blur,
-    Blit,
+    KawaseDown,
+    KawaseUp,
 }
 
 struct DirectXRenderPipelines {
     backdrop_pipeline: PipelineState<Backdrop>,
     backdrop_punch: Shading,
-    blur_pipeline: PipelineState<FilterParams>,
+    kawase_down_pipeline: PipelineState<FilterParams>,
+    kawase_up_pipeline: PipelineState<FilterParams>,
     blit_pipeline: PipelineState<FilterParams>,
     composite_pipeline: PipelineState<FilterParams>,
     mask_pipeline: PipelineState<FilterParams>,
@@ -484,73 +479,61 @@ impl DirectXRenderer {
         Ok(())
     }
 
-    /// Blurs a source into one of the ping-pong targets and returns the one holding the result.
+    /// Blurs a source with a dual Kawase blur and returns the full size target holding the result.
     ///
-    /// The resolution follows the radius: a small blur stays at full resolution, where downsampling
-    /// would turn text into mush, and only a wide one is worth shrinking first.
+    /// The source is halved once per level and grown back through the same targets, each up pass
+    /// overwriting the level the down pass left behind, since nothing reads that any more.
     fn blur_source(
         &mut self,
         source: Option<ID3D11ShaderResourceView>,
         sigma: f32,
         clip: Option<Bounds<ScaledPixels>>,
     ) -> Result<Option<ID3D11ShaderResourceView>> {
-        let step = BLUR_STEPS
-            .iter()
-            .position(|shrink| sigma <= BLUR_REACH * *shrink as f32)
-            .unwrap_or(BLUR_STEPS.len() - 1);
-        let shrink = BLUR_STEPS[step] as f32;
-        // Each pass reads a kernel's width beyond what the next one needs, so the region grows
-        // from the composited clip outwards. Every one reaches a texel further still: the
-        // blurred texture is sampled at full resolution, so a fragment on the clip's own edge
-        // draws part of its colour from the texel outside it, which nothing has written.
-        let region = |renderer: &Self, margin: f32, shrink: u32| match clip {
+        let kawase = Kawase::for_sigma(sigma);
+        let params = FilterParams {
+            offset: kawase.offset,
+            ..Default::default()
+        };
+        // Every pass covers the clip grown by what all the passes together read, which is at
+        // least what the ones after it still need. A texel more keeps the bilinear taps on the
+        // clip's own edge off texels nothing has written.
+        let reach = kawase.reach();
+        let region = |renderer: &Self, level: usize| match clip {
             Some(clip) => {
-                renderer.scissor(clip.dilate(ScaledPixels(margin + shrink as f32)), shrink)
+                let shrink = 1u32 << level;
+                renderer.scissor(clip.dilate(ScaledPixels(reach + shrink as f32)), shrink)
             }
             None => Ok(None),
         };
 
         let mut from = source;
-        for shrunk in 0..step {
-            let shrink = BLUR_STEPS[shrunk + 1];
-            let within = region(self, sigma * BLUR_REACH * 2., shrink)?;
-            from = self.filter_pass(Pass::Blit, from, [shrunk + 1, 0], None, within)?;
+        for level in 1..=kawase.levels {
+            let within = region(self, level)?;
+            from = self.filter_pass(Pass::KawaseDown, from, level, Some(params), within)?;
         }
-
-        let across = FilterParams {
-            direction: [1., 0.],
-            sigma: sigma / shrink,
-            ..Default::default()
-        };
-        let down = FilterParams {
-            direction: [0., 1.],
-            sigma: sigma / shrink,
-            ..Default::default()
-        };
-        let shrink = BLUR_STEPS[step];
-        let spread = region(self, sigma * BLUR_REACH, shrink)?;
-        let scratch = self.filter_pass(Pass::Blur, from, [step, 1], Some(across), spread)?;
-        let settled = region(self, 0., shrink)?;
-
-        self.filter_pass(Pass::Blur, scratch, [step, 0], Some(down), settled)
+        for level in (0..kawase.levels.max(1)).rev() {
+            let within = region(self, level)?;
+            from = self.filter_pass(Pass::KawaseUp, from, level, Some(params), within)?;
+        }
+        Ok(from)
     }
 
-    /// Draws one full-screen pass of a filter into a ping-pong target, returning what it wrote.
+    /// Draws one full-screen pass of a filter into a blur level, returning what it wrote.
     fn filter_pass(
         &mut self,
         pass: Pass,
         source: Option<ID3D11ShaderResourceView>,
-        target: [usize; 2],
+        level: usize,
         params: Option<FilterParams>,
         within: Option<[u32; 4]>,
     ) -> Result<Option<ID3D11ShaderResourceView>> {
         let (view, held, viewport) = {
             let resources = self.resources.as_ref().context("resources missing")?;
-            let step = &resources.filters.steps[target[0]][target[1]];
-            let shrink = BLUR_STEPS[target[0]] as f32;
+            let target = &resources.filters.levels[level];
+            let shrink = (1u32 << level) as f32;
             (
-                step.view.clone(),
-                step.source.clone(),
+                target.view.clone(),
+                target.source.clone(),
                 D3D11_VIEWPORT {
                     TopLeftX: 0.,
                     TopLeftY: 0.,
@@ -576,8 +559,8 @@ impl DirectXRenderer {
         }
 
         let pipeline = match pass {
-            Pass::Blur => &mut self.pipelines.blur_pipeline,
-            Pass::Blit => &mut self.pipelines.blit_pipeline,
+            Pass::KawaseDown => &mut self.pipelines.kawase_down_pipeline,
+            Pass::KawaseUp => &mut self.pipelines.kawase_up_pipeline,
         };
         pipeline.update_buffer(&device, &device_context, &[params.unwrap_or_default()])?;
         pipeline.draw_range_with_texture(
@@ -1465,10 +1448,17 @@ impl DirectXRenderPipelines {
             ShaderModule::BackdropPunch,
             create_blend_state_punch(device)?,
         )?;
-        let blur_pipeline = PipelineState::new(
+        let kawase_down_pipeline = PipelineState::new(
             device,
-            "blur_pipeline",
-            ShaderModule::Blur,
+            "kawase_down_pipeline",
+            ShaderModule::KawaseDown,
+            1,
+            create_blend_state_opaque(device)?,
+        )?;
+        let kawase_up_pipeline = PipelineState::new(
+            device,
+            "kawase_up_pipeline",
+            ShaderModule::KawaseUp,
             1,
             create_blend_state_opaque(device)?,
         )?;
@@ -1560,7 +1550,8 @@ impl DirectXRenderPipelines {
         Ok(Self {
             backdrop_pipeline,
             backdrop_punch,
-            blur_pipeline,
+            kawase_down_pipeline,
+            kawase_up_pipeline,
             blit_pipeline,
             composite_pipeline,
             mask_pipeline,
@@ -2423,7 +2414,9 @@ pub(crate) mod shader_resources {
         Backdrop,
         /// Fragment only. `vertex_source` sends it to `Backdrop` for a vertex stage.
         BackdropPunch,
-        Blur,
+        KawaseDown,
+        /// Fragment only. `vertex_source` sends it to `KawaseDown` for a vertex stage.
+        KawaseUp,
         Blit,
         Mask,
         Quad,
@@ -2458,6 +2451,7 @@ pub(crate) mod shader_resources {
         fn vertex_source(self) -> ShaderModule {
             match self {
                 ShaderModule::BackdropPunch => ShaderModule::Backdrop,
+                ShaderModule::KawaseUp => ShaderModule::KawaseDown,
                 ShaderModule::SubpixelSpriteLayered => ShaderModule::SubpixelSprite,
                 module => module,
             }
@@ -2502,9 +2496,13 @@ pub(crate) mod shader_resources {
                     ShaderTarget::Vertex => BACKDROP_VERTEX_BYTES,
                     ShaderTarget::Fragment => BACKDROP_PUNCH_FRAGMENT_BYTES,
                 },
-                ShaderModule::Blur => match target {
-                    ShaderTarget::Vertex => BLUR_VERTEX_BYTES,
-                    ShaderTarget::Fragment => BLUR_FRAGMENT_BYTES,
+                ShaderModule::KawaseDown => match target {
+                    ShaderTarget::Vertex => KAWASE_DOWN_VERTEX_BYTES,
+                    ShaderTarget::Fragment => KAWASE_DOWN_FRAGMENT_BYTES,
+                },
+                ShaderModule::KawaseUp => match target {
+                    ShaderTarget::Vertex => KAWASE_DOWN_VERTEX_BYTES,
+                    ShaderTarget::Fragment => KAWASE_UP_FRAGMENT_BYTES,
                 },
                 ShaderModule::Blit => match target {
                     ShaderTarget::Vertex => BLIT_VERTEX_BYTES,
@@ -2634,7 +2632,8 @@ pub(crate) mod shader_resources {
             match self {
                 ShaderModule::Backdrop => "backdrop",
                 ShaderModule::BackdropPunch => "backdrop_punch",
-                ShaderModule::Blur => "blur",
+                ShaderModule::KawaseDown => "kawase_down",
+                ShaderModule::KawaseUp => "kawase_up",
                 ShaderModule::Blit => "blit",
                 ShaderModule::Mask => "mask",
                 ShaderModule::Quad => "quad",

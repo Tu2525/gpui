@@ -1440,10 +1440,14 @@ fn fs_backdrop_punch(input: BackdropVarying) -> @location(0) vec4<f32> {
 
 // --- blur --- //
 
+// A dual Kawase blur: `fs_kawase_down` halves the image with five taps and `fs_kawase_up` grows
+// it back with eight. The down pass takes the offset in half texels of what it reads and the up
+// pass in quarter texels, which keeps its ring of taps from going hollow.
 struct Blur {
-    direction: vec2<f32>,
-    sigma: f32,
-    pad: u32,
+    offset: f32,
+    pad0: f32,
+    pad1: f32,
+    pad2: u32,
 }
 
 struct BlurVarying {
@@ -1462,26 +1466,34 @@ fn vs_blur(@builtin(vertex_index) vertex_id: u32) -> BlurVarying {
 }
 
 @fragment
-fn fs_blur(input: BlurVarying) -> @location(0) vec4<f32> {
+fn fs_kawase_down(input: BlurVarying) -> @location(0) vec4<f32> {
     let blur = load_blur(0u);
-    let texel = 1.0 / vec2<f32>(textureDimensions(t_sprite));
-    let step = blur.direction * texel;
-    let sigma = max(blur.sigma, 0.0001);
-    let reach = min(ceil(sigma * 3.0), 24.0);
-    let spread = 2.0 * sigma * sigma;
+    let half = 0.5 * blur.offset / vec2<f32>(textureDimensions(t_sprite));
+    let flipped = vec2<f32>(half.x, -half.y);
 
-    var total = textureSample(t_sprite, s_sprite, input.uv);
-    var weight = 1.0;
-    var offset = 1.0;
-    while (offset <= reach) {
-        let tap = exp(-offset * offset / spread);
-        total += tap * textureSample(t_sprite, s_sprite, input.uv + step * offset);
-        total += tap * textureSample(t_sprite, s_sprite, input.uv - step * offset);
-        weight += tap * 2.0;
-        offset += 1.0;
-    }
+    var total = textureSample(t_sprite, s_sprite, input.uv) * 4.0;
+    total += textureSample(t_sprite, s_sprite, input.uv - half);
+    total += textureSample(t_sprite, s_sprite, input.uv + half);
+    total += textureSample(t_sprite, s_sprite, input.uv - flipped);
+    total += textureSample(t_sprite, s_sprite, input.uv + flipped);
+    return total / 8.0;
+}
 
-    return total / weight;
+@fragment
+fn fs_kawase_up(input: BlurVarying) -> @location(0) vec4<f32> {
+    let blur = load_blur(0u);
+    let half = 0.25 * blur.offset / vec2<f32>(textureDimensions(t_sprite));
+    let flipped = vec2<f32>(half.x, -half.y);
+
+    var total = textureSample(t_sprite, s_sprite, input.uv + vec2<f32>(half.x * 2.0, 0.0));
+    total += textureSample(t_sprite, s_sprite, input.uv - vec2<f32>(half.x * 2.0, 0.0));
+    total += textureSample(t_sprite, s_sprite, input.uv + vec2<f32>(0.0, half.y * 2.0));
+    total += textureSample(t_sprite, s_sprite, input.uv - vec2<f32>(0.0, half.y * 2.0));
+    total += textureSample(t_sprite, s_sprite, input.uv + half) * 2.0;
+    total += textureSample(t_sprite, s_sprite, input.uv - half) * 2.0;
+    total += textureSample(t_sprite, s_sprite, input.uv + flipped) * 2.0;
+    total += textureSample(t_sprite, s_sprite, input.uv - flipped) * 2.0;
+    return total / 12.0;
 }
 
 @fragment

@@ -1369,9 +1369,9 @@ float4 backdrop_punch_fragment(BackdropFragmentInput input): SV_Target {
 struct FilterParams {
     Bounds source_bounds;
     Bounds fade_bounds;
-    float2 direction;
+    float2 pad;
     float2 transform_origin;
-    float sigma;
+    float offset;
     float scale;
     float fade_top;
     float fade_bottom;
@@ -1401,7 +1401,7 @@ FilterVertexOutput filter_vertex_impl(uint vertex_id) {
     return output;
 }
 
-FilterVertexOutput blur_vertex(uint vertex_id: SV_VertexID) {
+FilterVertexOutput kawase_down_vertex(uint vertex_id: SV_VertexID) {
     return filter_vertex_impl(vertex_id);
 }
 
@@ -1413,27 +1413,47 @@ FilterVertexOutput mask_vertex(uint vertex_id: SV_VertexID) {
     return filter_vertex_impl(vertex_id);
 }
 
-float4 blur_fragment(FilterFragmentInput input): SV_Target {
+// A dual Kawase blur: `kawase_down_fragment` halves the image with five taps and
+// `kawase_up_fragment` grows it back with eight. The down pass takes the offset in half texels
+// of what it reads and the up pass in quarter texels, which keeps its ring of taps from going
+// hollow.
+float4 kawase_down_fragment(FilterFragmentInput input): SV_Target {
     FilterParams params = filter_params[batch_start_index];
     float width;
     float height;
     t_sprite.GetDimensions(width, height);
-    float2 stride = params.direction / float2(width, height);
-    float sigma = max(params.sigma, 0.0001);
-    float reach = min(ceil(sigma * 3.0), 24.0);
-    float spread = 2.0 * sigma * sigma;
+    float2 half_step = 0.5 * params.offset / float2(width, height);
+    float2 flipped = float2(half_step.x, -half_step.y);
 
-    float4 total = t_sprite.Sample(s_sprite, input.uv);
-    float weight = 1.0;
-    for (float offset = 1.0; offset <= reach; offset += 1.0) {
-        float tap = exp(-offset * offset / spread);
-        total += tap * t_sprite.Sample(s_sprite, input.uv + stride * offset);
-        total += tap * t_sprite.Sample(s_sprite, input.uv - stride * offset);
-        weight += tap * 2.0;
-    }
-
-    return total / weight;
+    float4 total = t_sprite.Sample(s_sprite, input.uv) * 4.0;
+    total += t_sprite.Sample(s_sprite, input.uv - half_step);
+    total += t_sprite.Sample(s_sprite, input.uv + half_step);
+    total += t_sprite.Sample(s_sprite, input.uv - flipped);
+    total += t_sprite.Sample(s_sprite, input.uv + flipped);
+    return total / 8.0;
 }
+
+float4 kawase_up_fragment(FilterFragmentInput input): SV_Target {
+    FilterParams params = filter_params[batch_start_index];
+    float width;
+    float height;
+    t_sprite.GetDimensions(width, height);
+    float2 half_step = 0.25 * params.offset / float2(width, height);
+    float2 flipped = float2(half_step.x, -half_step.y);
+    float2 across = float2(half_step.x * 2.0, 0.0);
+    float2 down = float2(0.0, half_step.y * 2.0);
+
+    float4 total = t_sprite.Sample(s_sprite, input.uv + across);
+    total += t_sprite.Sample(s_sprite, input.uv - across);
+    total += t_sprite.Sample(s_sprite, input.uv + down);
+    total += t_sprite.Sample(s_sprite, input.uv - down);
+    total += t_sprite.Sample(s_sprite, input.uv + half_step) * 2.0;
+    total += t_sprite.Sample(s_sprite, input.uv - half_step) * 2.0;
+    total += t_sprite.Sample(s_sprite, input.uv + flipped) * 2.0;
+    total += t_sprite.Sample(s_sprite, input.uv - flipped) * 2.0;
+    return total / 12.0;
+}
+
 
 float4 blit_fragment(FilterFragmentInput input): SV_Target {
     return t_sprite.Sample(s_sprite, input.uv);

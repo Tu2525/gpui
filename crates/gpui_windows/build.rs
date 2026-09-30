@@ -33,7 +33,8 @@ mod shader_compilation {
         let modules = [
             ("backdrop", true),
             ("backdrop_punch", false),
-            ("blur", true),
+            ("kawase_down", true),
+            ("kawase_up", false),
             ("blit", true),
             ("mask", true),
             ("quad", true),
