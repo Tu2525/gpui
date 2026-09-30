@@ -433,24 +433,30 @@ pub struct Filter {
     pub translate: Point<ScaledPixels>,
 }
 
+/// The widest blur, as a standard deviation in scaled pixels, that runs as a gaussian at full
+/// resolution. A Kawase blur this narrow would pass through half resolution with too little
+/// spread to hide it, and a thin line comes back from there visibly stepped.
+pub const GAUSSIAN_SIGMA: f32 = 4.;
+
+/// How far a gaussian pass reads to either side, in texels, before its weights stop mattering.
+pub const GAUSSIAN_REACH: f32 = 3.;
+
 /// How many times a dual Kawase blur can halve the image. Every level doubles the radius, so six
 /// reach close to a hundred scaled pixels.
 pub const KAWASE_LEVELS: usize = 6;
+
+/// The fewest levels a Kawase blur uses, since the gaussian covers everything narrower.
+const KAWASE_SHALLOWEST: usize = 2;
 
 /// The distance between the offsets [`KAWASE_SPREAD`] was measured at.
 const KAWASE_STEP: f32 = 0.25;
 
 /// The standard deviation a dual Kawase blur spreads a point to, divided by `2^levels`, measured
 /// at offsets of `0, 0.25, 0.5, ...` with the one up pass and the bilinear stretch the blur ends
-/// on. Rows are the level counts `0` to `3`, and the last row serves every deeper count, since
+/// on. Rows are the level counts `2` and `3`, and the last row serves every deeper count, since
 /// the ratio stops moving by then. Each row ends where its kernel would go hollow in the middle
 /// and show the blurred shape twice.
-const KAWASE_SPREAD: [&[f32]; 5] = [
-    &[0.0, 0.25, 0.354, 0.433, 0.5, 0.559, 0.612, 0.661, 0.707],
-    &[
-        0.433, 0.433, 0.433, 0.456, 0.479, 0.592, 0.681, 0.768, 0.842, 0.905, 0.96, 1.019, 1.07,
-        1.184, 1.275, 1.356, 1.422,
-    ],
+const KAWASE_SPREAD: [&[f32]; 3] = [
     &[
         0.484, 0.484, 0.484, 0.505, 0.525, 0.651, 0.741, 0.825, 0.896, 0.958, 1.015, 1.077, 1.136,
         1.242, 1.335, 1.423, 1.502,
@@ -465,13 +471,33 @@ const KAWASE_SPREAD: [&[f32]; 5] = [
     ],
 ];
 
+/// How a renderer blurs by a given standard deviation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BlurPasses {
+    /// Two separable gaussian passes at full resolution, across and then down, with this
+    /// standard deviation in scaled pixels.
+    Gaussian(f32),
+    /// A dual Kawase blur.
+    Kawase(Kawase),
+}
+
+impl BlurPasses {
+    /// The blur that spreads a point as far as a gaussian of standard deviation `sigma`, in
+    /// scaled pixels.
+    pub fn for_sigma(sigma: f32) -> Self {
+        match sigma <= GAUSSIAN_SIGMA {
+            true => Self::Gaussian(sigma.max(0.)),
+            false => Self::Kawase(Kawase::for_sigma(sigma)),
+        }
+    }
+}
+
 /// The passes of a dual Kawase blur. It halves the image `levels` times with a five tap filter and
 /// grows it back one level with an eight tap one, leaving the rest of the way to the bilinear
 /// sample that composites it, so its cost barely grows with the radius.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Kawase {
-    /// How many times the image is halved. Zero is a single eight tap pass at full resolution,
-    /// which keeps a small blur from going soft.
+    /// How many times the image is halved, at least two.
     pub levels: usize,
     /// How far the taps spread. A down pass puts its corner taps this many half texels out in
     /// the texture it reads, and an up pass this many quarter texels out, which keeps its ring of
@@ -484,12 +510,13 @@ pub struct Kawase {
 impl Kawase {
     /// The passes that spread a point as far as a gaussian of standard deviation `sigma`, in
     /// scaled pixels. It takes the fewest levels that reach, since every level costs a pass, and a
-    /// radius past the deepest level is capped there.
+    /// radius past the deepest level is capped there. Anything under [`GAUSSIAN_SIGMA`] comes out
+    /// wider than asked, so go through [`BlurPasses::for_sigma`].
     pub fn for_sigma(sigma: f32) -> Self {
         let sigma = sigma.max(0.);
-        let mut levels = 0;
+        let mut levels = KAWASE_SHALLOWEST;
         loop {
-            let spread = KAWASE_SPREAD[levels.min(KAWASE_SPREAD.len() - 1)];
+            let spread = KAWASE_SPREAD[(levels - KAWASE_SHALLOWEST).min(KAWASE_SPREAD.len() - 1)];
             let scale = (1u32 << levels) as f32;
             let widest = spread[spread.len() - 1] * scale;
             if sigma <= widest || levels == KAWASE_LEVELS {
@@ -506,7 +533,7 @@ impl Kawase {
                 return Self {
                     levels,
                     offset: step * KAWASE_STEP,
-                    settled: levels.saturating_sub(1),
+                    settled: levels - 1,
                 };
             }
             levels += 1;
@@ -521,10 +548,7 @@ impl Kawase {
         // is `2^level` scaled pixels wide.
         let tap = self.offset * 0.5 + 1.;
         let deepest = (1u32 << self.levels) as f32;
-        match self.levels {
-            0 => tap,
-            _ => tap * (deepest * 2. - 1.),
-        }
+        tap * (deepest * 2. - 1.)
     }
 }
 

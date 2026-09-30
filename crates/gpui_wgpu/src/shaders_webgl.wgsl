@@ -227,7 +227,7 @@ fn load_backdrop(instance_id: u32) -> Backdrop {
 }
 
 fn load_blur(instance_id: u32) -> Blur {
-    return Blur(0.0, 0.0, 0.0, 0u);
+    return Blur(vec2<f32>(0.0), 0.0, 0u);
 }
 
 

@@ -1377,6 +1377,38 @@ fragment float4 backdrop_punch_fragment(
   return float4(0.0, 0.0, 0.0, coverage * backdrop.opacity);
 }
 
+// A narrow blur runs `gaussian_fragment` across and then down at full resolution, with `radius`
+// as its standard deviation. It pairs neighbouring taps into one bilinear fetch placed between
+// them by their weights, which halves the fetches, and relies on sampling a texture of the same
+// size as the target, so every pair lands between two texel centres along the axis.
+fragment float4 gaussian_fragment(
+    FilterFragmentInput input [[stage_in]],
+    constant BlurParams *params [[buffer(FilterInputIndex_Params)]],
+    texture2d<float> source [[texture(FilterInputIndex_Source)]]) {
+  constexpr sampler source_sampler(mag_filter::linear, min_filter::linear,
+                                   address::clamp_to_edge);
+  float2 texel = float2(params->direction[0], params->direction[1]) /
+                 float2(source.get_width(), source.get_height());
+  float sigma = max(params->radius, 0.0001);
+  float reach = min(ceil(sigma * 3.0), 24.0);
+  float spread = 2.0 * sigma * sigma;
+
+  float4 total = source.sample(source_sampler, input.uv);
+  float weight = 1.0;
+  for (float inner = 1.0; inner <= reach; inner += 2.0) {
+    float outer = inner + 1.0;
+    float inner_weight = exp(-inner * inner / spread);
+    float outer_weight = outer <= reach ? exp(-outer * outer / spread) : 0.0;
+    float pair = inner_weight + outer_weight;
+    float2 at = texel * ((inner * inner_weight + outer * outer_weight) / pair);
+    total += pair * source.sample(source_sampler, input.uv + at);
+    total += pair * source.sample(source_sampler, input.uv - at);
+    weight += pair * 2.0;
+  }
+
+  return total / weight;
+}
+
 // A dual Kawase blur: `kawase_down_fragment` halves the image with five taps and
 // `kawase_up_fragment` grows it back with eight. The down pass takes the offset in half texels
 // of what it reads and the up pass in quarter texels, which keeps its ring of taps from going
@@ -1388,7 +1420,7 @@ fragment float4 kawase_down_fragment(
   constexpr sampler source_sampler(mag_filter::linear, min_filter::linear,
                                    address::clamp_to_edge);
   float2 half_step =
-      0.5 * params->offset / float2(source.get_width(), source.get_height());
+      0.5 * params->radius / float2(source.get_width(), source.get_height());
   float2 flipped = float2(half_step.x, -half_step.y);
 
   float4 total = source.sample(source_sampler, input.uv) * 4.0;
@@ -1406,7 +1438,7 @@ fragment float4 kawase_up_fragment(
   constexpr sampler source_sampler(mag_filter::linear, min_filter::linear,
                                    address::clamp_to_edge);
   float2 half_step =
-      0.25 * params->offset / float2(source.get_width(), source.get_height());
+      0.25 * params->radius / float2(source.get_width(), source.get_height());
   float2 flipped = float2(half_step.x, -half_step.y);
   float2 across = float2(half_step.x * 2.0, 0.0);
   float2 down = float2(0.0, half_step.y * 2.0);

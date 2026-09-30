@@ -100,8 +100,10 @@ struct FilterTargets {
     frame: RenderTexture,
     layers: Vec<RenderTexture>,
     /// One target per blur level, the frame's size halved as many times as its index. Level zero
-    /// holds the finished blur.
+    /// holds a finished gaussian.
     levels: Vec<RenderTexture>,
+    /// Where a gaussian keeps its pass across before the pass down.
+    scratch: RenderTexture,
 }
 
 impl FilterTargets {
@@ -120,6 +122,7 @@ impl FilterTargets {
             frame: create_render_texture(device, width, height)?,
             layers,
             levels,
+            scratch: create_render_texture(device, width, height)?,
         })
     }
 }
@@ -129,9 +132,9 @@ impl FilterTargets {
 struct FilterParams {
     source_bounds: Bounds<ScaledPixels>,
     fade_bounds: Bounds<ScaledPixels>,
-    pad: [f32; 2],
+    direction: [f32; 2],
     transform_origin: [f32; 2],
-    offset: f32,
+    radius: f32,
     scale: f32,
     fade_top: f32,
     fade_bottom: f32,
@@ -144,9 +147,9 @@ const _: () = {
     assert!(std::mem::size_of::<FilterParams>() == 20 * std::mem::size_of::<f32>());
     assert!(std::mem::offset_of!(FilterParams, source_bounds) == 0);
     assert!(std::mem::offset_of!(FilterParams, fade_bounds) == 16);
-    assert!(std::mem::offset_of!(FilterParams, pad) == 32);
+    assert!(std::mem::offset_of!(FilterParams, direction) == 32);
     assert!(std::mem::offset_of!(FilterParams, transform_origin) == 40);
-    assert!(std::mem::offset_of!(FilterParams, offset) == 48);
+    assert!(std::mem::offset_of!(FilterParams, radius) == 48);
     assert!(std::mem::offset_of!(FilterParams, scale) == 52);
     assert!(std::mem::offset_of!(FilterParams, fade_top) == 56);
     assert!(std::mem::offset_of!(FilterParams, fade_bottom) == 60);
@@ -157,13 +160,22 @@ const _: () = {
 
 #[derive(Clone, Copy)]
 enum Pass {
+    Gaussian,
     KawaseDown,
     KawaseUp,
+}
+
+/// The offscreen target a blur pass draws into.
+#[derive(Clone, Copy)]
+enum BlurTarget {
+    Level(usize),
+    Scratch,
 }
 
 struct DirectXRenderPipelines {
     backdrop_pipeline: PipelineState<Backdrop>,
     backdrop_punch: Shading,
+    gaussian_pipeline: PipelineState<FilterParams>,
     kawase_down_pipeline: PipelineState<FilterParams>,
     kawase_up_pipeline: PipelineState<FilterParams>,
     blit_pipeline: PipelineState<FilterParams>,
@@ -479,17 +491,73 @@ impl DirectXRenderer {
         Ok(())
     }
 
-    /// Blurs a source with a dual Kawase blur and returns the target holding the result, at
-    /// the level [`Kawase::settled`] names. Whatever samples it stretches it back to full size.
+    /// Blurs a source and returns the target holding the result. A narrow blur comes back at
+    /// full size, a wide one at the level [`Kawase::settled`] names, and whatever samples it
+    /// stretches it back up.
     fn blur_source(
         &mut self,
         source: Option<ID3D11ShaderResourceView>,
         sigma: f32,
         clip: Option<Bounds<ScaledPixels>>,
     ) -> Result<Option<ID3D11ShaderResourceView>> {
-        let kawase = Kawase::for_sigma(sigma);
+        match BlurPasses::for_sigma(sigma) {
+            BlurPasses::Gaussian(sigma) => self.gaussian_blur(source, sigma, clip),
+            BlurPasses::Kawase(kawase) => self.kawase_blur(source, kawase, clip),
+        }
+    }
+
+    /// Blurs a source across into the scratch target and down into level zero, both at full
+    /// size. The pass across covers the clip grown by the kernel, since the pass down reads that
+    /// far above and below it.
+    fn gaussian_blur(
+        &mut self,
+        source: Option<ID3D11ShaderResourceView>,
+        sigma: f32,
+        clip: Option<Bounds<ScaledPixels>>,
+    ) -> Result<Option<ID3D11ShaderResourceView>> {
+        let across = FilterParams {
+            direction: [1., 0.],
+            radius: sigma,
+            ..Default::default()
+        };
+        let down = FilterParams {
+            direction: [0., 1.],
+            radius: sigma,
+            ..Default::default()
+        };
+        let region = |renderer: &Self, margin: f32| match clip {
+            Some(clip) => renderer.scissor(clip.dilate(ScaledPixels(margin)), 1),
+            None => Ok(None),
+        };
+        let reach = (sigma * GAUSSIAN_REACH).ceil() + 1.;
+
+        let within = region(self, reach)?;
+        let scratch = self.filter_pass(
+            Pass::Gaussian,
+            source,
+            BlurTarget::Scratch,
+            Some(across),
+            within,
+        )?;
+        let within = region(self, 1.)?;
+        self.filter_pass(
+            Pass::Gaussian,
+            scratch,
+            BlurTarget::Level(0),
+            Some(down),
+            within,
+        )
+    }
+
+    /// Blurs a source with a dual Kawase blur and returns the level it settled at.
+    fn kawase_blur(
+        &mut self,
+        source: Option<ID3D11ShaderResourceView>,
+        kawase: Kawase,
+        clip: Option<Bounds<ScaledPixels>>,
+    ) -> Result<Option<ID3D11ShaderResourceView>> {
         let params = FilterParams {
-            offset: kawase.offset,
+            radius: kawase.offset,
             ..Default::default()
         };
         // Every pass covers the clip grown by what all the passes together read. The targets are
@@ -508,26 +576,41 @@ impl DirectXRenderer {
         let mut from = source;
         for level in 1..=kawase.levels {
             let within = region(self, level)?;
-            from = self.filter_pass(Pass::KawaseDown, from, level, Some(params), within)?;
+            from = self.filter_pass(
+                Pass::KawaseDown,
+                from,
+                BlurTarget::Level(level),
+                Some(params),
+                within,
+            )?;
         }
         let within = region(self, kawase.settled)?;
-        self.filter_pass(Pass::KawaseUp, from, kawase.settled, Some(params), within)
+        self.filter_pass(
+            Pass::KawaseUp,
+            from,
+            BlurTarget::Level(kawase.settled),
+            Some(params),
+            within,
+        )
     }
 
-    /// Draws one full-screen pass of a filter into a blur level, returning what it wrote. The
+    /// Draws one full-screen pass of a filter into a blur target, returning what it wrote. The
     /// target is not cleared first, since the pass writes every texel it covers.
     fn filter_pass(
         &mut self,
         pass: Pass,
         source: Option<ID3D11ShaderResourceView>,
-        level: usize,
+        target: BlurTarget,
         params: Option<FilterParams>,
         within: Option<[u32; 4]>,
     ) -> Result<Option<ID3D11ShaderResourceView>> {
         let (view, held, viewport) = {
             let resources = self.resources.as_ref().context("resources missing")?;
-            let target = &resources.filters.levels[level];
-            let shrink = (1u32 << level) as f32;
+            let (target, shrink) = match target {
+                BlurTarget::Level(level) => (&resources.filters.levels[level], 1u32 << level),
+                BlurTarget::Scratch => (&resources.filters.scratch, 1),
+            };
+            let shrink = shrink as f32;
             (
                 target.view.clone(),
                 target.source.clone(),
@@ -553,6 +636,7 @@ impl DirectXRenderer {
         }
 
         let pipeline = match pass {
+            Pass::Gaussian => &mut self.pipelines.gaussian_pipeline,
             Pass::KawaseDown => &mut self.pipelines.kawase_down_pipeline,
             Pass::KawaseUp => &mut self.pipelines.kawase_up_pipeline,
         };
@@ -1442,6 +1526,13 @@ impl DirectXRenderPipelines {
             ShaderModule::BackdropPunch,
             create_blend_state_punch(device)?,
         )?;
+        let gaussian_pipeline = PipelineState::new(
+            device,
+            "gaussian_pipeline",
+            ShaderModule::Gaussian,
+            1,
+            create_blend_state_opaque(device)?,
+        )?;
         let kawase_down_pipeline = PipelineState::new(
             device,
             "kawase_down_pipeline",
@@ -1544,6 +1635,7 @@ impl DirectXRenderPipelines {
         Ok(Self {
             backdrop_pipeline,
             backdrop_punch,
+            gaussian_pipeline,
             kawase_down_pipeline,
             kawase_up_pipeline,
             blit_pipeline,
@@ -2408,6 +2500,7 @@ pub(crate) mod shader_resources {
         Backdrop,
         /// Fragment only. `vertex_source` sends it to `Backdrop` for a vertex stage.
         BackdropPunch,
+        Gaussian,
         KawaseDown,
         /// Fragment only. `vertex_source` sends it to `KawaseDown` for a vertex stage.
         KawaseUp,
@@ -2489,6 +2582,10 @@ pub(crate) mod shader_resources {
                 ShaderModule::BackdropPunch => match target {
                     ShaderTarget::Vertex => BACKDROP_VERTEX_BYTES,
                     ShaderTarget::Fragment => BACKDROP_PUNCH_FRAGMENT_BYTES,
+                },
+                ShaderModule::Gaussian => match target {
+                    ShaderTarget::Vertex => GAUSSIAN_VERTEX_BYTES,
+                    ShaderTarget::Fragment => GAUSSIAN_FRAGMENT_BYTES,
                 },
                 ShaderModule::KawaseDown => match target {
                     ShaderTarget::Vertex => KAWASE_DOWN_VERTEX_BYTES,
@@ -2626,6 +2723,7 @@ pub(crate) mod shader_resources {
             match self {
                 ShaderModule::Backdrop => "backdrop",
                 ShaderModule::BackdropPunch => "backdrop_punch",
+                ShaderModule::Gaussian => "gaussian",
                 ShaderModule::KawaseDown => "kawase_down",
                 ShaderModule::KawaseUp => "kawase_up",
                 ShaderModule::Blit => "blit",

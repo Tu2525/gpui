@@ -7,8 +7,9 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, KAWASE_LEVELS, Kawase,
-    LayerEffect, PaintSurface, Path, Point, PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
+    AtlasTextureId, Background, BlurPasses, Bounds, ContentMask, DevicePixels, GAUSSIAN_REACH,
+    KAWASE_LEVELS, Kawase, LayerEffect, PaintSurface, Path, Point, PrimitiveBatch, ScaledPixels,
+    Scene, Size, point, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -130,6 +131,7 @@ pub struct MetalRenderer {
     surfaces_pipeline_state: metal::RenderPipelineState,
     backdrops_pipeline_state: metal::RenderPipelineState,
     backdrop_punch_pipeline_state: metal::RenderPipelineState,
+    gaussian_pipeline_state: metal::RenderPipelineState,
     kawase_down_pipeline_state: metal::RenderPipelineState,
     kawase_up_pipeline_state: metal::RenderPipelineState,
     blit_pipeline_state: metal::RenderPipelineState,
@@ -355,6 +357,15 @@ impl MetalRenderer {
             MTLPixelFormat::BGRA8Unorm,
             FilterBlend::Punch,
         );
+        let gaussian_pipeline_state = build_filter_pipeline_state(
+            &device,
+            &library,
+            "gaussian",
+            "filter_vertex",
+            "gaussian_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+            FilterBlend::Replace,
+        );
         let kawase_down_pipeline_state = build_filter_pipeline_state(
             &device,
             &library,
@@ -424,6 +435,7 @@ impl MetalRenderer {
             surfaces_pipeline_state,
             backdrops_pipeline_state,
             backdrop_punch_pipeline_state,
+            gaussian_pipeline_state,
             kawase_down_pipeline_state,
             kawase_up_pipeline_state,
             blit_pipeline_state,
@@ -1017,6 +1029,7 @@ impl MetalRenderer {
                 levels: (0..=KAWASE_LEVELS)
                     .map(|level| target(width >> level, height >> level))
                     .collect(),
+                scratch: target(width, height),
             });
         }
 
@@ -1090,8 +1103,9 @@ impl MetalRenderer {
         encoder.end_encoding();
     }
 
-    /// Blurs a source with a dual Kawase blur and returns the target holding the result, at
-    /// the level [`Kawase::settled`] names. Whatever samples it stretches it back to full size.
+    /// Blurs a source and returns the target holding the result. A narrow blur comes back at
+    /// full size, a wide one at the level [`Kawase::settled`] names, and whatever samples it
+    /// stretches it back up.
     fn blur_source<'a>(
         &self,
         targets: &'a FilterTargets,
@@ -1101,10 +1115,77 @@ impl MetalRenderer {
         clip: Option<Bounds<ScaledPixels>>,
         viewport_size: Size<DevicePixels>,
     ) -> &'a metal::TextureRef {
-        let kawase = Kawase::for_sigma(sigma);
+        match BlurPasses::for_sigma(sigma) {
+            BlurPasses::Gaussian(sigma) => {
+                self.gaussian_blur(targets, command_buffer, source, sigma, clip, viewport_size)
+            }
+            BlurPasses::Kawase(kawase) => {
+                self.kawase_blur(targets, command_buffer, source, kawase, clip, viewport_size)
+            }
+        }
+    }
+
+    /// Blurs a source across into the scratch target and down into level zero, both at full
+    /// size. The pass across covers the clip grown by the kernel, since the pass down reads that
+    /// far above and below it.
+    fn gaussian_blur<'a>(
+        &self,
+        targets: &'a FilterTargets,
+        command_buffer: &metal::CommandBufferRef,
+        source: &'a metal::TextureRef,
+        sigma: f32,
+        clip: Option<Bounds<ScaledPixels>>,
+        viewport_size: Size<DevicePixels>,
+    ) -> &'a metal::TextureRef {
+        let across = BlurParams {
+            direction: [1., 0.],
+            radius: sigma,
+            pad: 0.,
+        };
+        let down = BlurParams {
+            direction: [0., 1.],
+            radius: sigma,
+            pad: 0.,
+        };
+        let within = |margin: f32| {
+            clip.and_then(|clip| Self::scissor(clip.dilate(ScaledPixels(margin)), viewport_size, 1))
+        };
+        let reach = (sigma * GAUSSIAN_REACH).ceil() + 1.;
+
+        let settled: &metal::TextureRef = &targets.levels[0];
+        self.filter_pass(
+            command_buffer,
+            &self.gaussian_pipeline_state,
+            source,
+            &targets.scratch,
+            Some(&across),
+            within(reach),
+        );
+        self.filter_pass(
+            command_buffer,
+            &self.gaussian_pipeline_state,
+            &targets.scratch,
+            settled,
+            Some(&down),
+            within(1.),
+        );
+        settled
+    }
+
+    /// Blurs a source with a dual Kawase blur and returns the level it settled at.
+    fn kawase_blur<'a>(
+        &self,
+        targets: &'a FilterTargets,
+        command_buffer: &metal::CommandBufferRef,
+        source: &'a metal::TextureRef,
+        kawase: Kawase,
+        clip: Option<Bounds<ScaledPixels>>,
+        viewport_size: Size<DevicePixels>,
+    ) -> &'a metal::TextureRef {
         let params = BlurParams {
-            offset: kawase.offset,
-            pad: [0.; 3],
+            direction: [0., 0.],
+            radius: kawase.offset,
+            pad: 0.,
         };
         // Every pass covers the clip grown by what all the passes together read, which is at
         // least what the ones after it still need. A texel more keeps the bilinear taps on the
@@ -1788,15 +1869,18 @@ struct FilterTargets {
     frame: metal::Texture,
     layers: Vec<metal::Texture>,
     /// One target per blur level, the frame's size halved as many times as its index. Level zero
-    /// holds the finished blur.
+    /// holds a finished gaussian.
     levels: Vec<metal::Texture>,
+    /// Where a gaussian keeps its pass across before the pass down.
+    scratch: metal::Texture,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct BlurParams {
-    pub offset: f32,
-    pub pad: [f32; 3],
+    pub direction: [f32; 2],
+    pub radius: f32,
+    pub pad: f32,
 }
 
 #[repr(C)]

@@ -2,8 +2,9 @@ use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, KAWASE_LEVELS, Kawase, LayerEffect,
-    Path, Point, PrimitiveBatch, ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+    AtlasTextureId, Background, BlurPasses, Bounds, DevicePixels, GAUSSIAN_REACH, GpuSpecs,
+    KAWASE_LEVELS, Kawase, LayerEffect, Path, Point, PrimitiveBatch, ScaledPixels, Scene, Size,
+    get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -124,6 +125,7 @@ pub struct WgpuSurfaceConfig {
 struct WgpuPipelines {
     backdrops: wgpu::RenderPipeline,
     backdrop_punch: wgpu::RenderPipeline,
+    gaussian: wgpu::RenderPipeline,
     kawase_down: wgpu::RenderPipeline,
     kawase_up: wgpu::RenderPipeline,
     blit: wgpu::RenderPipeline,
@@ -212,6 +214,7 @@ struct BackdropViews {
     frame: wgpu::TextureView,
     layers: Vec<wgpu::TextureView>,
     levels: Vec<wgpu::TextureView>,
+    scratch: wgpu::TextureView,
 }
 
 #[repr(C, align(8))]
@@ -232,8 +235,9 @@ struct MaskParams {
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct BlurParams {
-    offset: f32,
-    pad: [u32; 3],
+    direction: [f32; 2],
+    radius: f32,
+    pad: u32,
 }
 
 /// How deeply filtered layers can nest before the innermost ones stop being filtered.
@@ -245,14 +249,21 @@ struct BackdropTargets {
     frame_view: wgpu::TextureView,
     layers: Vec<(wgpu::Texture, wgpu::TextureView)>,
     /// One target per blur level, the frame's size halved as many times as its index. Level zero
-    /// holds the finished blur.
+    /// holds a finished gaussian.
     levels: Vec<(wgpu::Texture, wgpu::TextureView)>,
+    /// Where a gaussian keeps its pass across before the pass down.
+    scratch: (wgpu::Texture, wgpu::TextureView),
 }
 
 impl BackdropTargets {
     fn drop_textures(&self) {
         self.frame.destroy();
-        for (texture, _) in self.layers.iter().chain(&self.levels) {
+        for (texture, _) in self
+            .layers
+            .iter()
+            .chain(&self.levels)
+            .chain([&self.scratch])
+        {
             texture.destroy();
         }
     }
@@ -1041,6 +1052,19 @@ impl WgpuRenderer {
             write_mask: wgpu::ColorWrites::ALL,
         };
 
+        let gaussian = create_pipeline(
+            "gaussian",
+            "vs_blur",
+            "fs_gaussian",
+            &layouts.globals,
+            &layouts.instances,
+            Some(&layouts.texture),
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(opaque_target.clone())],
+            1,
+            &shader_module,
+        );
+
         let kawase_down = create_pipeline(
             "kawase_down",
             "vs_blur",
@@ -1283,6 +1307,7 @@ impl WgpuRenderer {
         WgpuPipelines {
             backdrops,
             backdrop_punch,
+            gaussian,
             kawase_down,
             kawase_up,
             blit,
@@ -1385,8 +1410,9 @@ impl WgpuRenderer {
         pass.set_scissor_rect(0, 0, self.surface_config.width, self.surface_config.height);
     }
 
-    /// Blurs a source with a dual Kawase blur and returns the target holding the result, at
-    /// the level [`Kawase::settled`] names. Whatever samples it stretches it back to full size.
+    /// Blurs a source and returns the target holding the result. A narrow blur comes back at
+    /// full size, a wide one at the level [`Kawase::settled`] names, and whatever samples it
+    /// stretches it back up.
     fn blur_source(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -1396,13 +1422,90 @@ impl WgpuRenderer {
         clip: Option<Bounds<ScaledPixels>>,
         instance_offset: &mut u64,
     ) -> Result<wgpu::TextureView> {
-        let kawase = Kawase::for_sigma(sigma);
+        match BlurPasses::for_sigma(sigma) {
+            BlurPasses::Gaussian(sigma) => {
+                self.gaussian_blur(encoder, views, source, sigma, clip, instance_offset)
+            }
+            BlurPasses::Kawase(kawase) => {
+                self.kawase_blur(encoder, views, source, kawase, clip, instance_offset)
+            }
+        }
+    }
+
+    /// Blurs a source across into the scratch target and down into level zero, both at full
+    /// size. The pass across covers the clip grown by the kernel, since the pass down reads that
+    /// far above and below it.
+    fn gaussian_blur(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        views: &BackdropViews,
+        source: &wgpu::TextureView,
+        sigma: f32,
+        clip: Option<Bounds<ScaledPixels>>,
+        instance_offset: &mut u64,
+    ) -> Result<wgpu::TextureView> {
+        let across = self.write_instance_binding(
+            "gaussian_across_bind_group",
+            instance_offset,
+            &[BlurParams {
+                direction: [1., 0.],
+                radius: sigma,
+                pad: 0,
+            }],
+        )?;
+        let down = self.write_instance_binding(
+            "gaussian_down_bind_group",
+            instance_offset,
+            &[BlurParams {
+                direction: [0., 1.],
+                radius: sigma,
+                pad: 0,
+            }],
+        )?;
+        let gaussian = self.resources().pipelines.gaussian.clone();
+        let within =
+            |margin: f32| clip.map(|clip| self.scissor(clip.dilate(ScaledPixels(margin)), 1));
+        let reach = (sigma * GAUSSIAN_REACH).ceil() + 1.;
+
+        let settled = &views.levels[0];
+        self.fullscreen_pass(
+            encoder,
+            "gaussian_across",
+            &gaussian,
+            source,
+            &views.scratch,
+            &across,
+            within(reach),
+        );
+        self.fullscreen_pass(
+            encoder,
+            "gaussian_down",
+            &gaussian,
+            &views.scratch,
+            settled,
+            &down,
+            within(1.),
+        );
+        Ok(settled.clone())
+    }
+
+    /// Blurs a source with a dual Kawase blur and returns the level it settled at.
+    fn kawase_blur(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        views: &BackdropViews,
+        source: &wgpu::TextureView,
+        kawase: Kawase,
+        clip: Option<Bounds<ScaledPixels>>,
+        instance_offset: &mut u64,
+    ) -> Result<wgpu::TextureView> {
         let params = self.write_instance_binding(
             "kawase_bind_group",
             instance_offset,
             &[BlurParams {
-                offset: kawase.offset,
-                pad: [0; 3],
+                direction: [0., 0.],
+                radius: kawase.offset,
+                pad: 0,
             }],
         )?;
         let down = self.resources().pipelines.kawase_down.clone();
@@ -1521,6 +1624,7 @@ impl WgpuRenderer {
                 .iter()
                 .map(|(_, view)| view.clone())
                 .collect(),
+            scratch: targets.scratch.1.clone(),
         })
     }
 
@@ -1560,12 +1664,14 @@ impl WgpuRenderer {
         let levels = (0..=KAWASE_LEVELS)
             .map(|level| target(&format!("blur_{level}"), width >> level, height >> level))
             .collect();
+        let scratch = target("blur_scratch", width, height);
 
         resources.backdrop_targets = Some(BackdropTargets {
             frame,
             frame_view,
             layers,
             levels,
+            scratch,
         });
     }
 

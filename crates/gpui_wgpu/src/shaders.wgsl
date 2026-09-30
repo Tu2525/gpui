@@ -1440,14 +1440,15 @@ fn fs_backdrop_punch(input: BackdropVarying) -> @location(0) vec4<f32> {
 
 // --- blur --- //
 
-// A dual Kawase blur: `fs_kawase_down` halves the image with five taps and `fs_kawase_up` grows
-// it back with eight. The down pass takes the offset in half texels of what it reads and the up
-// pass in quarter texels, which keeps its ring of taps from going hollow.
+// A narrow blur runs `fs_gaussian` across and then down at full resolution, with `radius` as
+// its standard deviation. A wide one runs a dual Kawase blur: `fs_kawase_down` halves the image
+// with five taps and `fs_kawase_up` grows it back with eight, with `radius` as the offset, in
+// half texels of what the down pass reads and quarter texels of what the up pass reads, which
+// keeps the up pass's ring of taps from going hollow.
 struct Blur {
-    offset: f32,
-    pad0: f32,
-    pad1: f32,
-    pad2: u32,
+    direction: vec2<f32>,
+    radius: f32,
+    pad: u32,
 }
 
 struct BlurVarying {
@@ -1465,10 +1466,39 @@ fn vs_blur(@builtin(vertex_index) vertex_id: u32) -> BlurVarying {
     return out;
 }
 
+// Pairs neighbouring taps into one bilinear fetch placed between them by their weights, which
+// halves the fetches of a plain gaussian. It relies on sampling a texture of the same size as the
+// target, so every pair lands between two texel centres along the axis.
+@fragment
+fn fs_gaussian(input: BlurVarying) -> @location(0) vec4<f32> {
+    let blur = load_blur(0u);
+    let texel = blur.direction / vec2<f32>(textureDimensions(t_sprite));
+    let sigma = max(blur.radius, 0.0001);
+    let reach = min(ceil(sigma * 3.0), 24.0);
+    let spread = 2.0 * sigma * sigma;
+
+    var total = textureSample(t_sprite, s_sprite, input.uv);
+    var weight = 1.0;
+    var inner = 1.0;
+    while (inner <= reach) {
+        let outer = inner + 1.0;
+        let inner_weight = exp(-inner * inner / spread);
+        let outer_weight = select(0.0, exp(-outer * outer / spread), outer <= reach);
+        let pair = inner_weight + outer_weight;
+        let at = texel * ((inner * inner_weight + outer * outer_weight) / pair);
+        total += pair * textureSample(t_sprite, s_sprite, input.uv + at);
+        total += pair * textureSample(t_sprite, s_sprite, input.uv - at);
+        weight += pair * 2.0;
+        inner += 2.0;
+    }
+
+    return total / weight;
+}
+
 @fragment
 fn fs_kawase_down(input: BlurVarying) -> @location(0) vec4<f32> {
     let blur = load_blur(0u);
-    let half = 0.5 * blur.offset / vec2<f32>(textureDimensions(t_sprite));
+    let half = 0.5 * blur.radius / vec2<f32>(textureDimensions(t_sprite));
     let flipped = vec2<f32>(half.x, -half.y);
 
     var total = textureSample(t_sprite, s_sprite, input.uv) * 4.0;
@@ -1482,7 +1512,7 @@ fn fs_kawase_down(input: BlurVarying) -> @location(0) vec4<f32> {
 @fragment
 fn fs_kawase_up(input: BlurVarying) -> @location(0) vec4<f32> {
     let blur = load_blur(0u);
-    let half = 0.25 * blur.offset / vec2<f32>(textureDimensions(t_sprite));
+    let half = 0.25 * blur.radius / vec2<f32>(textureDimensions(t_sprite));
     let flipped = vec2<f32>(half.x, -half.y);
 
     var total = textureSample(t_sprite, s_sprite, input.uv + vec2<f32>(half.x * 2.0, 0.0));
