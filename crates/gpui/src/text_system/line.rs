@@ -97,6 +97,7 @@ impl ShapedLine {
             align_width,
             &self.decoration_runs,
             &[],
+            None,
             window,
             cx,
         )?;
@@ -228,6 +229,7 @@ impl LineLayout {
             align_width,
             decoration_runs,
             &[],
+            None,
             window,
             cx,
         )
@@ -290,6 +292,34 @@ impl WrappedLine {
         window: &mut Window,
         cx: &mut App,
     ) -> Result<()> {
+        self.paint_with(origin, line_height, align, bounds, None, window, cx)
+    }
+
+    /// Paint this line of text in one colour, glyphs and decorations alike, the way a text
+    /// shadow draws it. Emoji are left out, since they have no single colour to take.
+    pub fn paint_tinted(
+        &self,
+        origin: Point<Pixels>,
+        line_height: Pixels,
+        align: TextAlign,
+        bounds: Option<Bounds<Pixels>>,
+        tint: Hsla,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Result<()> {
+        self.paint_with(origin, line_height, align, bounds, Some(tint), window, cx)
+    }
+
+    fn paint_with(
+        &self,
+        origin: Point<Pixels>,
+        line_height: Pixels,
+        align: TextAlign,
+        bounds: Option<Bounds<Pixels>>,
+        tint: Option<Hsla>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Result<()> {
         let align_width = match bounds {
             Some(bounds) => Some(bounds.size.width),
             None => self.layout.wrap_width,
@@ -303,11 +333,10 @@ impl WrappedLine {
             align_width,
             &self.decoration_runs,
             &self.wrap_boundaries,
+            tint,
             window,
             cx,
-        )?;
-
-        Ok(())
+        )
     }
 
     /// Paint the background of line of text to the window.
@@ -349,6 +378,7 @@ fn paint_line(
     align_width: Option<Pixels>,
     decoration_runs: &[DecorationRun],
     wrap_boundaries: &[WrapBoundary],
+    tint: Option<Hsla>,
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
@@ -468,7 +498,9 @@ fn paint_line(
                                     glyph_origin.y + baseline_offset.y + (layout.descent * 0.618),
                                 ),
                                 UnderlineStyle {
-                                    color: Some(run_underline.color.unwrap_or(style_run.color)),
+                                    color: Some(
+                                        tint.or(run_underline.color).unwrap_or(style_run.color),
+                                    ),
                                     thickness: run_underline.thickness,
                                     wavy: run_underline.wavy,
                                 },
@@ -487,14 +519,16 @@ fn paint_line(
                                         + (((layout.ascent * 0.5) + baseline_offset.y) * 0.5),
                                 ),
                                 StrikethroughStyle {
-                                    color: Some(run_strikethrough.color.unwrap_or(style_run.color)),
+                                    color: Some(
+                                        tint.or(run_strikethrough.color).unwrap_or(style_run.color),
+                                    ),
                                     thickness: run_strikethrough.thickness,
                                 },
                             ));
                         }
 
                         run_end += style_run.len as usize;
-                        color = style_run.color;
+                        color = tint.unwrap_or(style_run.color);
                     } else {
                         run_end = layout.len;
                         finished_underline = current_underline.take();
@@ -535,6 +569,9 @@ fn paint_line(
                 if max_glyph_bounds.intersects(&content_mask.bounds) {
                     let vertical_offset = point(px(0.0), glyph.position.y);
                     if glyph.is_emoji {
+                        if tint.is_some() {
+                            continue;
+                        }
                         window.paint_emoji(
                             glyph_origin + baseline_offset + vertical_offset,
                             run.font_id,

@@ -438,6 +438,41 @@ pub enum TextAlign {
     Right,
 }
 
+/// A shadow painted under text, like one entry of the CSS `text-shadow` property. It follows
+/// the glyphs and any underline or strikethrough, but not emoji, which keep their own colours.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct TextShadow {
+    /// The colour the shadow copy of the text is painted in.
+    pub color: Hsla,
+    /// How far the shadow sits from the text.
+    pub offset: Point<Pixels>,
+    /// How far the shadow blurs, with the same radius as [`LayerFilter::blur`].
+    pub blur: Pixels,
+}
+
+impl TextShadow {
+    /// Creates a shadow straight under the text with no blur.
+    pub fn new(color: impl Into<Hsla>) -> Self {
+        Self {
+            color: color.into(),
+            offset: Point::default(),
+            blur: px(0.),
+        }
+    }
+
+    /// Moves the shadow away from the text.
+    pub fn offset(mut self, x: Pixels, y: Pixels) -> Self {
+        self.offset = point(x, y);
+        self
+    }
+
+    /// Sets how far the shadow blurs.
+    pub fn blur(mut self, blur: Pixels) -> Self {
+        self.blur = blur;
+        self
+    }
+}
+
 /// Effects applied to an element and its subtree as a whole, the way CSS filters work.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct LayerFilter {
@@ -525,6 +560,10 @@ pub struct TextStyle {
 
     /// The number of lines to display before truncating the text
     pub line_clamp: Option<usize>,
+
+    /// Shadows painted under the text, like the CSS `text-shadow` property. The first one
+    /// lands on top.
+    pub shadows: Vec<TextShadow>,
 }
 
 impl Default for TextStyle {
@@ -546,6 +585,7 @@ impl Default for TextStyle {
             text_overflow: None,
             text_align: TextAlign::default(),
             line_clamp: None,
+            shadows: Vec::new(),
         }
     }
 }

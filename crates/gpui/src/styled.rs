@@ -2,7 +2,7 @@ use crate::{
     self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BorderStyle, CursorStyle,
     DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
     FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, JustifyContent, Length,
-    Pixels, SharedString, StrikethroughStyle, StyleRefinement, TextAlign, TextOverflow,
+    Pixels, SharedString, StrikethroughStyle, StyleRefinement, TextAlign, TextOverflow, TextShadow,
     TextStyleRefinement, UnderlineStyle, WhiteSpace, px, relative, rems,
 };
 pub use gpui_macros::{
@@ -513,6 +513,14 @@ pub trait Styled: Sized {
     /// This value cascades to its child elements.
     fn text_color(mut self, color: impl Into<Hsla>) -> Self {
         self.text_style().color = Some(color.into());
+        self
+    }
+
+    /// Sets the shadows painted under the text of this element, the first one on top.
+    ///
+    /// This value cascades to its child elements.
+    fn text_shadow(mut self, shadows: impl IntoIterator<Item = TextShadow>) -> Self {
+        self.text_style().shadows = Some(shadows.into_iter().collect());
         self
     }
 
