@@ -996,6 +996,18 @@ impl PlatformWindow for WindowsWindow {
             .log_err();
     }
 
+    fn can_release_idle_gpu_memory(&self) -> bool {
+        true
+    }
+
+    fn release_idle_gpu_memory(&self) {
+        // A nested message pump can run this while a draw holds the renderer. The next idle
+        // stretch frees the targets instead.
+        if let Ok(mut renderer) = self.state.renderer.try_borrow_mut() {
+            renderer.release_idle_targets();
+        }
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.state.renderer.borrow().sprite_atlas()
     }
