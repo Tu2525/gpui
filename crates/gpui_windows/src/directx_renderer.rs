@@ -289,6 +289,10 @@ struct DirectXGlobalElements {
     global_params_buffer: Option<ID3D11Buffer>,
     batch_params_buffer: Option<ID3D11Buffer>,
     sampler: Option<ID3D11SamplerState>,
+    /// Clamps to the edge, for filter and compositing passes. A blur tap past the bottom of a
+    /// target would otherwise wrap to its top, and the transparent rows it reads there show the
+    /// desktop through an edge the blurred element touches.
+    filter_sampler: Option<ID3D11SamplerState>,
 }
 
 struct Annotation<'a>(&'a ID3DUserDefinedAnnotation);
@@ -452,9 +456,9 @@ impl DirectXRenderer {
             devices.device.clone(),
             devices.device_context.clone(),
             self.globals
-                .sampler
+                .filter_sampler
                 .as_ref()
-                .context("missing sampler")?
+                .context("missing filter sampler")?
                 .clone(),
             self.globals
                 .batch_params_buffer
@@ -1832,28 +1836,14 @@ impl DirectXGlobalElements {
         let global_params_buffer = create_constant_buffer::<GlobalParams>(device)?;
         let batch_params_buffer = create_constant_buffer::<BatchParams>(device)?;
 
-        let sampler = unsafe {
-            let desc = D3D11_SAMPLER_DESC {
-                Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
-                AddressU: D3D11_TEXTURE_ADDRESS_WRAP,
-                AddressV: D3D11_TEXTURE_ADDRESS_WRAP,
-                AddressW: D3D11_TEXTURE_ADDRESS_WRAP,
-                MipLODBias: 0.0,
-                MaxAnisotropy: 1,
-                ComparisonFunc: D3D11_COMPARISON_ALWAYS,
-                BorderColor: [0.0; 4],
-                MinLOD: 0.0,
-                MaxLOD: D3D11_FLOAT32_MAX,
-            };
-            let mut output = None;
-            device.CreateSamplerState(&desc, Some(&mut output))?;
-            output
-        };
+        let sampler = create_sampler(device, D3D11_TEXTURE_ADDRESS_WRAP)?;
+        let filter_sampler = create_sampler(device, D3D11_TEXTURE_ADDRESS_CLAMP)?;
 
         Ok(Self {
             global_params_buffer,
             batch_params_buffer,
             sampler,
+            filter_sampler,
         })
     }
 }
@@ -3058,4 +3048,26 @@ mod dxgi {
             number & 0xFFFF
         ))
     }
+}
+
+/// A linear sampler that treats coordinates outside a texture with `address`.
+fn create_sampler(
+    device: &ID3D11Device,
+    address: D3D11_TEXTURE_ADDRESS_MODE,
+) -> Result<Option<ID3D11SamplerState>> {
+    let desc = D3D11_SAMPLER_DESC {
+        Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+        AddressU: address,
+        AddressV: address,
+        AddressW: address,
+        MipLODBias: 0.0,
+        MaxAnisotropy: 1,
+        ComparisonFunc: D3D11_COMPARISON_ALWAYS,
+        BorderColor: [0.0; 4],
+        MinLOD: 0.0,
+        MaxLOD: D3D11_FLOAT32_MAX,
+    };
+    let mut output = None;
+    unsafe { device.CreateSamplerState(&desc, Some(&mut output))? };
+    Ok(output)
 }
