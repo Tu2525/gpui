@@ -711,18 +711,19 @@ impl DirectXRenderer {
         params: Option<FilterParams>,
         within: Option<[u32; 4]>,
     ) -> Result<Option<ID3D11ShaderResourceView>> {
-        let shrink = target.shrink() as f32;
+        let shrink = target.shrink();
         let target = self.filter_target(target)?;
         let (view, held, viewport) = {
             let resources = self.resources.as_ref().context("resources missing")?;
+            let (width, height) = level_size(&resources.viewport, shrink);
             (
                 target.view,
                 target.source,
                 D3D11_VIEWPORT {
                     TopLeftX: 0.,
                     TopLeftY: 0.,
-                    Width: resources.viewport.Width / shrink,
-                    Height: resources.viewport.Height / shrink,
+                    Width: width as f32,
+                    Height: height as f32,
                     MinDepth: 0.,
                     MaxDepth: 1.,
                 },
@@ -847,30 +848,25 @@ impl DirectXRenderer {
         )
     }
 
-    /// Clamps a region to the target it is drawn into, shrunk to the blur step it runs at.
+    /// Clamps a region to the target it is drawn into, shrunk to the blur step it runs at. Every
+    /// texel the region touches is covered, so a blur level is written out to the frame's edge
+    /// even where the region starts part way into a texel.
     fn scissor(&self, bounds: Bounds<ScaledPixels>, shrink: u32) -> Result<Option<[u32; 4]>> {
         let resources = self.resources.as_ref().context("resources missing")?;
+        let (width, height) = level_size(&resources.viewport, shrink);
         let shrink = shrink as f32;
-        let width = resources.viewport.Width / shrink;
-        let height = resources.viewport.Height / shrink;
-        let left = (bounds.origin.x.0 / shrink).max(0.).min(width);
-        let top = (bounds.origin.y.0 / shrink).max(0.).min(height);
-        let right = ((bounds.origin.x.0 + bounds.size.width.0) / shrink)
-            .max(0.)
-            .min(width);
-        let bottom = ((bounds.origin.y.0 + bounds.size.height.0) / shrink)
-            .max(0.)
-            .min(height);
+        let edge = |at: f32, round: fn(f32) -> f32, limit: u32| {
+            (round(at / shrink).max(0.) as u32).min(limit)
+        };
+        let left = edge(bounds.origin.x.0, f32::floor, width);
+        let top = edge(bounds.origin.y.0, f32::floor, height);
+        let right = edge(bounds.origin.x.0 + bounds.size.width.0, f32::ceil, width);
+        let bottom = edge(bounds.origin.y.0 + bounds.size.height.0, f32::ceil, height);
         if right <= left || bottom <= top {
             return Ok(None);
         }
 
-        Ok(Some([
-            left as u32,
-            top as u32,
-            (right - left) as u32,
-            (bottom - top) as u32,
-        ]))
+        Ok(Some([left, top, right - left, bottom - top]))
     }
 
     fn set_scissor(&self, within: [u32; 4]) {
@@ -3070,4 +3066,14 @@ fn create_sampler(
     let mut output = None;
     unsafe { device.CreateSamplerState(&desc, Some(&mut output))? };
     Ok(output)
+}
+
+/// The size in texels of a target `shrink` times smaller than the frame. Blur levels are made at
+/// exactly this size, so every pass draws over the whole texture and no row or column is left
+/// unwritten at the frame's edge.
+fn level_size(viewport: &D3D11_VIEWPORT, shrink: u32) -> (u32, u32) {
+    (
+        viewport.Width as u32 / shrink,
+        viewport.Height as u32 / shrink,
+    )
 }
