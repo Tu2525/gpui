@@ -1,6 +1,7 @@
 use std::{
     slice,
     sync::{Arc, OnceLock},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -29,6 +30,10 @@ const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 const PATH_MULTISAMPLE_COUNT: u32 = 4;
 /// How deeply filtered layers can nest before the innermost ones stop being filtered.
 const LAYER_DEPTH: usize = 4;
+/// How long an offscreen target may go unused before its memory is given back. A frame with a
+/// blur, layer or path on screen touches its targets every time, so only targets that nothing
+/// on screen draws through are released.
+const IDLE_RELEASE: Duration = Duration::from_secs(2);
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
 
 pub(crate) struct FontInfo {
@@ -56,6 +61,9 @@ pub(crate) struct DirectXRenderer {
     /// In that case we want to discard the first frame that we draw as we got reset in the middle of a frame
     /// meaning we lost all the allocated gpu textures and scene resources.
     skip_draws: bool,
+
+    /// When the frame being drawn started, which stamps every offscreen target it touches.
+    frame_time: Instant,
 }
 
 /// Direct3D objects
@@ -75,11 +83,8 @@ struct DirectXResources {
     render_target: Option<ID3D11Texture2D>,
     render_target_view: Option<ID3D11RenderTargetView>,
 
-    // Path intermediate textures (with MSAA)
-    path_intermediate_texture: ID3D11Texture2D,
-    path_intermediate_srv: Option<ID3D11ShaderResourceView>,
-    path_intermediate_msaa_texture: ID3D11Texture2D,
-    path_intermediate_msaa_view: Option<ID3D11RenderTargetView>,
+    /// Path intermediate textures (with MSAA), created by the first frame that draws a path.
+    paths: Option<PathTargets>,
 
     // Offscreen targets the frame blurs and masks through
     filters: FilterTargets,
@@ -89,42 +94,137 @@ struct DirectXResources {
 }
 
 /// A texture the renderer can both draw into and sample from.
+#[derive(Clone)]
 struct RenderTexture {
     _texture: ID3D11Texture2D,
     view: Option<ID3D11RenderTargetView>,
     source: Option<ID3D11ShaderResourceView>,
 }
 
-/// Offscreen targets a frame needs to blur and mask what it has drawn.
-struct FilterTargets {
-    frame: RenderTexture,
-    layers: Vec<RenderTexture>,
-    /// One target per blur level, the frame's size halved as many times as its index. Level zero
-    /// holds a finished gaussian.
-    levels: Vec<RenderTexture>,
+/// An offscreen target created the first time a frame needs it and released once it has gone
+/// `IDLE_RELEASE` without use.
+struct Scratch {
+    texture: RenderTexture,
+    used: Instant,
+}
+
+/// One of the offscreen targets filters draw through.
+#[derive(Clone, Copy)]
+enum FilterTarget {
+    /// The frame itself, drawn offscreen so a backdrop can sample what lies under it.
+    Frame,
+    /// The target a filtered layer is drawn into, by nesting depth.
+    Layer(usize),
+    /// One blur level, the frame's size halved as many times as its index. Level zero holds a
+    /// finished gaussian.
+    Level(usize),
     /// Where a gaussian keeps its pass across before the pass down.
-    scratch: RenderTexture,
+    Scratch,
+}
+
+impl FilterTarget {
+    /// How many times smaller than the frame the target is on each side.
+    fn shrink(self) -> u32 {
+        match self {
+            Self::Level(level) => 1 << level,
+            Self::Frame | Self::Layer(_) | Self::Scratch => 1,
+        }
+    }
+}
+
+/// Offscreen targets a frame needs to blur and mask what it has drawn, all made for one swap
+/// chain size. Each one is allocated the first time a frame draws through it, so a frame with
+/// one shallow blur pays for the targets it touches rather than for every depth and level.
+struct FilterTargets {
+    width: u32,
+    height: u32,
+    frame: Option<Scratch>,
+    layers: [Option<Scratch>; LAYER_DEPTH],
+    levels: [Option<Scratch>; KAWASE_LEVELS + 1],
+    scratch: Option<Scratch>,
 }
 
 impl FilterTargets {
-    fn new(device: &ID3D11Device, width: u32, height: u32) -> Result<Self> {
-        let mut levels = Vec::with_capacity(KAWASE_LEVELS + 1);
-        for level in 0..=KAWASE_LEVELS {
-            let (width, height) = (width >> level, height >> level);
-            levels.push(create_render_texture(device, width, height)?);
+    fn new(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            frame: None,
+            layers: std::array::from_fn(|_| None),
+            levels: std::array::from_fn(|_| None),
+            scratch: None,
         }
-        let mut layers = Vec::with_capacity(LAYER_DEPTH);
-        for _ in 0..LAYER_DEPTH {
-            layers.push(create_render_texture(device, width, height)?);
-        }
-
-        Ok(Self {
-            frame: create_render_texture(device, width, height)?,
-            layers,
-            levels,
-            scratch: create_render_texture(device, width, height)?,
-        })
     }
+
+    fn slot(&mut self, target: FilterTarget) -> &mut Option<Scratch> {
+        match target {
+            FilterTarget::Frame => &mut self.frame,
+            FilterTarget::Layer(depth) => &mut self.layers[depth.min(LAYER_DEPTH - 1)],
+            FilterTarget::Level(level) => &mut self.levels[level],
+            FilterTarget::Scratch => &mut self.scratch,
+        }
+    }
+
+    /// A target this frame has already drawn through, which every target but the one being
+    /// opened is by the time it is read.
+    fn get(&self, target: FilterTarget) -> Result<&RenderTexture> {
+        let slot = match target {
+            FilterTarget::Frame => &self.frame,
+            FilterTarget::Layer(depth) => &self.layers[depth.min(LAYER_DEPTH - 1)],
+            FilterTarget::Level(level) => &self.levels[level],
+            FilterTarget::Scratch => &self.scratch,
+        };
+        slot.as_ref()
+            .map(|scratch| &scratch.texture)
+            .context("missing filter target")
+    }
+
+    /// The target, created at the swap chain's size (shrunk for a blur level) if no frame has
+    /// drawn through it since it was last released, and marked as used by the frame at `now`.
+    fn touch(
+        &mut self,
+        device: &ID3D11Device,
+        target: FilterTarget,
+        now: Instant,
+    ) -> Result<RenderTexture> {
+        let shrink = target.shrink();
+        let (width, height) = (self.width / shrink, self.height / shrink);
+        let slot = self.slot(target);
+        if slot.is_none() {
+            *slot = Some(Scratch {
+                texture: create_render_texture(device, width, height)?,
+                used: now,
+            });
+        }
+        let scratch = slot.as_mut().context("missing filter target")?;
+        scratch.used = now;
+        Ok(scratch.texture.clone())
+    }
+
+    /// Drops every target no frame has drawn through within `IDLE_RELEASE` of `now`.
+    fn release_idle(&mut self, now: Instant) {
+        let slots = std::iter::once(&mut self.frame)
+            .chain(self.layers.iter_mut())
+            .chain(self.levels.iter_mut())
+            .chain(std::iter::once(&mut self.scratch));
+        for slot in slots {
+            if slot
+                .as_ref()
+                .is_some_and(|scratch| now.duration_since(scratch.used) >= IDLE_RELEASE)
+            {
+                *slot = None;
+            }
+        }
+    }
+}
+
+/// The textures paths are rasterized through, made for the swap chain's size.
+struct PathTargets {
+    texture: ID3D11Texture2D,
+    srv: Option<ID3D11ShaderResourceView>,
+    msaa_texture: ID3D11Texture2D,
+    msaa_view: Option<ID3D11RenderTargetView>,
+    used: Instant,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -165,13 +265,6 @@ enum Pass {
     KawaseUp,
 }
 
-/// The offscreen target a blur pass draws into.
-#[derive(Clone, Copy)]
-enum BlurTarget {
-    Level(usize),
-    Scratch,
-}
-
 struct DirectXRenderPipelines {
     backdrop_pipeline: PipelineState<Backdrop>,
     backdrop_punch: Shading,
@@ -196,6 +289,10 @@ struct DirectXGlobalElements {
     global_params_buffer: Option<ID3D11Buffer>,
     batch_params_buffer: Option<ID3D11Buffer>,
     sampler: Option<ID3D11SamplerState>,
+    /// Clamps to the edge, for filter and compositing passes. A blur tap past the bottom of a
+    /// target would otherwise wrap to its top, and the transparent rows it reads there show the
+    /// desktop through an edge the blurred element touches.
+    filter_sampler: Option<ID3D11SamplerState>,
 }
 
 struct Annotation<'a>(&'a ID3DUserDefinedAnnotation);
@@ -292,6 +389,7 @@ impl DirectXRenderer {
             width: 1,
             height: 1,
             skip_draws: false,
+            frame_time: Instant::now(),
         })
     }
 
@@ -358,9 +456,9 @@ impl DirectXRenderer {
             devices.device.clone(),
             devices.device_context.clone(),
             self.globals
-                .sampler
+                .filter_sampler
                 .as_ref()
-                .context("missing sampler")?
+                .context("missing filter sampler")?
                 .clone(),
             self.globals
                 .batch_params_buffer
@@ -375,8 +473,8 @@ impl DirectXRenderer {
         let resources = self.resources.as_ref().context("resources missing")?;
         let devices = self.devices.as_ref().context("devices missing")?;
         let view = match depth {
-            Some(depth) => &resources.filters.layers[depth.min(LAYER_DEPTH - 1)].view,
-            None => &resources.filters.frame.view,
+            Some(depth) => &resources.filters.get(FilterTarget::Layer(depth))?.view,
+            None => &resources.filters.get(FilterTarget::Frame)?.view,
         };
         unsafe {
             devices
@@ -402,14 +500,12 @@ impl DirectXRenderer {
         }
     }
 
-    /// Clears one of the offscreen layer targets and points the pipeline at it.
-    fn open_layer(&self, depth: usize) -> Result<()> {
-        let resources = self.resources.as_ref().context("resources missing")?;
+    /// Clears one of the offscreen layer targets, creating it if it was released, and points the
+    /// pipeline at it.
+    fn open_layer(&mut self, depth: usize) -> Result<()> {
+        let target = self.filter_target(FilterTarget::Layer(depth))?;
         let devices = self.devices.as_ref().context("devices missing")?;
-        let view = resources.filters.layers[depth.min(LAYER_DEPTH - 1)]
-            .view
-            .as_ref()
-            .context("missing layer target")?;
+        let view = target.view.as_ref().context("missing layer target")?;
         unsafe {
             devices
                 .device_context
@@ -430,12 +526,19 @@ impl DirectXRenderer {
         let depth = stack.len();
         let source = {
             let resources = self.resources.as_ref().context("resources missing")?;
-            resources.filters.layers[depth.min(LAYER_DEPTH - 1)]
+            resources
+                .filters
+                .get(FilterTarget::Layer(depth))?
                 .source
                 .clone()
         };
         let blurred = match layer.filter.blurs() {
-            true => self.blur_source(source, layer.filter.blur, Some(layer.blur_bounds(clip)))?,
+            true => self.blur_source(
+                source,
+                Some(depth),
+                layer.filter.blur,
+                Some(layer.blur_bounds(clip)),
+            )?,
             false => source,
         };
 
@@ -493,25 +596,29 @@ impl DirectXRenderer {
 
     /// Blurs a source and returns the target holding the result. A narrow blur comes back at
     /// full size, a wide one at the level [`Kawase::settled`] names, and whatever samples it
-    /// stretches it back up.
+    /// stretches it back up. A source that is the layer at depth `spare` is read by nothing
+    /// else, so a gaussian writes its result back into it rather than into a full-size target of
+    /// its own.
     fn blur_source(
         &mut self,
         source: Option<ID3D11ShaderResourceView>,
+        spare: Option<usize>,
         sigma: f32,
         clip: Option<Bounds<ScaledPixels>>,
     ) -> Result<Option<ID3D11ShaderResourceView>> {
         match BlurPasses::for_sigma(sigma) {
-            BlurPasses::Gaussian(sigma) => self.gaussian_blur(source, sigma, clip),
+            BlurPasses::Gaussian(sigma) => self.gaussian_blur(source, spare, sigma, clip),
             BlurPasses::Kawase(kawase) => self.kawase_blur(source, kawase, clip),
         }
     }
 
-    /// Blurs a source across into the scratch target and down into level zero, both at full
-    /// size. The pass across covers the clip grown by the kernel, since the pass down reads that
-    /// far above and below it.
+    /// Blurs a source across into the scratch target and down into level zero, or back into the
+    /// `spare` layer it came from, both at full size. The pass across covers the clip grown by
+    /// the kernel, since the pass down reads that far above and below it.
     fn gaussian_blur(
         &mut self,
         source: Option<ID3D11ShaderResourceView>,
+        spare: Option<usize>,
         sigma: f32,
         clip: Option<Bounds<ScaledPixels>>,
     ) -> Result<Option<ID3D11ShaderResourceView>> {
@@ -535,7 +642,7 @@ impl DirectXRenderer {
         let scratch = self.filter_pass(
             Pass::Gaussian,
             source,
-            BlurTarget::Scratch,
+            FilterTarget::Scratch,
             Some(across),
             within,
         )?;
@@ -543,7 +650,7 @@ impl DirectXRenderer {
         self.filter_pass(
             Pass::Gaussian,
             scratch,
-            BlurTarget::Level(0),
+            spare.map_or(FilterTarget::Level(0), FilterTarget::Layer),
             Some(down),
             within,
         )
@@ -579,7 +686,7 @@ impl DirectXRenderer {
             from = self.filter_pass(
                 Pass::KawaseDown,
                 from,
-                BlurTarget::Level(level),
+                FilterTarget::Level(level),
                 Some(params),
                 within,
             )?;
@@ -588,7 +695,7 @@ impl DirectXRenderer {
         self.filter_pass(
             Pass::KawaseUp,
             from,
-            BlurTarget::Level(kawase.settled),
+            FilterTarget::Level(kawase.settled),
             Some(params),
             within,
         )
@@ -600,20 +707,17 @@ impl DirectXRenderer {
         &mut self,
         pass: Pass,
         source: Option<ID3D11ShaderResourceView>,
-        target: BlurTarget,
+        target: FilterTarget,
         params: Option<FilterParams>,
         within: Option<[u32; 4]>,
     ) -> Result<Option<ID3D11ShaderResourceView>> {
+        let shrink = target.shrink() as f32;
+        let target = self.filter_target(target)?;
         let (view, held, viewport) = {
             let resources = self.resources.as_ref().context("resources missing")?;
-            let (target, shrink) = match target {
-                BlurTarget::Level(level) => (&resources.filters.levels[level], 1u32 << level),
-                BlurTarget::Scratch => (&resources.filters.scratch, 1),
-            };
-            let shrink = shrink as f32;
             (
-                target.view.clone(),
-                target.source.clone(),
+                target.view,
+                target.source,
                 D3D11_VIEWPORT {
                     TopLeftX: 0.,
                     TopLeftY: 0.,
@@ -667,9 +771,9 @@ impl DirectXRenderer {
     ) -> Result<()> {
         let frame = {
             let resources = self.resources.as_ref().context("resources missing")?;
-            resources.filters.frame.source.clone()
+            resources.filters.get(FilterTarget::Frame)?.source.clone()
         };
-        let blurred = self.blur_source(frame, sigma, clip)?;
+        let blurred = self.blur_source(frame, None, sigma, clip)?;
         self.restore_frame(mirrored)?;
 
         let (_, device_context, sampler, batch_params) = self.pipeline_handles()?;
@@ -721,7 +825,7 @@ impl DirectXRenderer {
     fn blit_frame(&mut self) -> Result<()> {
         let source = {
             let resources = self.resources.as_ref().context("resources missing")?;
-            resources.filters.frame.source.clone()
+            resources.filters.get(FilterTarget::Frame)?.source.clone()
         };
         self.restore_frame(false)?;
 
@@ -891,6 +995,7 @@ impl DirectXRenderer {
             // and so likely do not have the textures anymore that are required for drawing
             return Ok(());
         }
+        self.frame_time = Instant::now();
         self.pre_draw(&match background_appearance {
             WindowBackgroundAppearance::Opaque => [1.0f32; 4],
             _ => [0.0f32; 4],
@@ -902,10 +1007,7 @@ impl DirectXRenderer {
         // from, so a frame carrying them is drawn offscreen and blitted back at the end.
         let mirrored = !scene.backdrops.is_empty();
         if mirrored {
-            let cleared = {
-                let resources = self.resources.as_ref().context("resources missing")?;
-                resources.filters.frame.view.clone()
-            };
+            let cleared = self.filter_target(FilterTarget::Frame)?.view;
             let devices = self.devices.as_ref().context("devices missing")?;
             if let Some(cleared) = cleared.as_ref() {
                 unsafe {
@@ -1037,7 +1139,66 @@ impl DirectXRenderer {
             self.blit_frame()?;
         }
 
-        self.present()
+        let presented = self.present();
+        self.release_targets_idle_at(self.frame_time);
+        presented
+    }
+
+    /// Frees offscreen targets that no frame has drawn through for `IDLE_RELEASE`. Every frame
+    /// checks this itself, so a caller only needs it for a window that has stopped drawing.
+    pub(crate) fn release_idle_targets(&mut self) {
+        self.release_targets_idle_at(Instant::now());
+    }
+
+    /// Drops every offscreen target that no frame has drawn through within `IDLE_RELEASE` of
+    /// `now`. The device context keeps a texture alive until the work that uses it is done, so
+    /// this is safe while earlier frames are still in flight.
+    fn release_targets_idle_at(&mut self, now: Instant) {
+        let Some(resources) = self.resources.as_mut() else {
+            return;
+        };
+        resources.filters.release_idle(now);
+        if resources
+            .paths
+            .as_ref()
+            .is_some_and(|paths| now.duration_since(paths.used) >= IDLE_RELEASE)
+        {
+            resources.paths = None;
+        }
+    }
+
+    /// One filter target, created if no frame has drawn through it since it was last released.
+    fn filter_target(&mut self, target: FilterTarget) -> Result<RenderTexture> {
+        let now = self.frame_time;
+        let device = &self.devices.as_ref().context("devices missing")?.device;
+        self.resources
+            .as_mut()
+            .context("resources missing")?
+            .filters
+            .touch(device, target, now)
+    }
+
+    /// The path textures, created if no frame has drawn a path since they were last released.
+    fn path_targets(&mut self) -> Result<&PathTargets> {
+        let now = self.frame_time;
+        let (width, height) = (self.width, self.height);
+        let device = &self.devices.as_ref().context("devices missing")?.device;
+        let resources = self.resources.as_mut().context("resources missing")?;
+        if resources.paths.is_none() {
+            let (texture, srv) = create_path_intermediate_texture(device, width, height)?;
+            let (msaa_texture, msaa_view) =
+                create_path_intermediate_msaa_texture_and_view(device, width, height)?;
+            resources.paths = Some(PathTargets {
+                texture,
+                srv,
+                msaa_texture,
+                msaa_view,
+                used: now,
+            });
+        }
+        let paths = resources.paths.as_mut().context("missing path targets")?;
+        paths.used = now;
+        Ok(paths)
     }
 
     pub(crate) fn resize(&mut self, new_size: Size<DevicePixels>) -> Result<()> {
@@ -1183,19 +1344,25 @@ impl DirectXRenderer {
             return Ok(());
         }
 
+        let (texture, msaa_texture, msaa_view) = {
+            let targets = self.path_targets()?;
+            (
+                targets.texture.clone(),
+                targets.msaa_texture.clone(),
+                targets.msaa_view.clone(),
+            )
+        };
         let devices = self.devices.as_ref().context("devices missing")?;
-        let resources = self.resources.as_ref().context("resources missing")?;
         // Clear intermediate MSAA texture
         unsafe {
             devices.device_context.ClearRenderTargetView(
-                resources.path_intermediate_msaa_view.as_ref().unwrap(),
+                msaa_view.as_ref().context("missing path target")?,
                 &[0.0; 4],
             );
             // Set intermediate MSAA texture as render target
-            devices.device_context.OMSetRenderTargets(
-                Some(slice::from_ref(&resources.path_intermediate_msaa_view)),
-                None,
-            );
+            devices
+                .device_context
+                .OMSetRenderTargets(Some(slice::from_ref(&msaa_view)), None);
         }
 
         // Collect all vertices and sprites for a single draw call
@@ -1226,9 +1393,9 @@ impl DirectXRenderer {
         // Resolve MSAA to non-MSAA intermediate texture
         unsafe {
             devices.device_context.ResolveSubresource(
-                &resources.path_intermediate_texture,
+                &texture,
                 0,
-                &resources.path_intermediate_msaa_texture,
+                &msaa_texture,
                 0,
                 RENDER_TARGET_FORMAT,
             );
@@ -1275,7 +1442,13 @@ impl DirectXRenderer {
         // Draw the sprites with the path texture
         self.pipelines.path_sprite_pipeline.draw_with_texture(
             &devices.device_context,
-            slice::from_ref(&resources.path_intermediate_srv),
+            slice::from_ref(
+                &resources
+                    .paths
+                    .as_ref()
+                    .context("missing path targets")?
+                    .srv,
+            ),
             slice::from_ref(&self.globals.sampler),
             sprites.len() as u32,
         )
@@ -1456,16 +1629,9 @@ impl DirectXResources {
             )?
         };
 
-        let (
-            render_target,
-            render_target_view,
-            path_intermediate_texture,
-            path_intermediate_srv,
-            path_intermediate_msaa_texture,
-            path_intermediate_msaa_view,
-            viewport,
-        ) = create_resources(devices, &swap_chain, width, height)?;
-        let filters = FilterTargets::new(&devices.device, width, height)?;
+        let (render_target, render_target_view, viewport) =
+            create_resources(devices, &swap_chain, width, height)?;
+        let filters = FilterTargets::new(width, height);
         set_rasterizer_state(&devices.device, &devices.device_context)?;
 
         Ok(Self {
@@ -1473,10 +1639,7 @@ impl DirectXResources {
             filters,
             render_target: Some(render_target),
             render_target_view,
-            path_intermediate_texture,
-            path_intermediate_msaa_texture,
-            path_intermediate_msaa_view,
-            path_intermediate_srv,
+            paths: None,
             viewport,
         })
     }
@@ -1488,22 +1651,13 @@ impl DirectXResources {
         width: u32,
         height: u32,
     ) -> Result<()> {
-        let (
-            render_target,
-            render_target_view,
-            path_intermediate_texture,
-            path_intermediate_srv,
-            path_intermediate_msaa_texture,
-            path_intermediate_msaa_view,
-            viewport,
-        ) = create_resources(devices, &self.swap_chain, width, height)?;
-        self.filters = FilterTargets::new(&devices.device, width, height)?;
+        let (render_target, render_target_view, viewport) =
+            create_resources(devices, &self.swap_chain, width, height)?;
+        // The offscreen targets are rebuilt at the new size by the first frame that needs them.
+        self.filters = FilterTargets::new(width, height);
+        self.paths = None;
         self.render_target = Some(render_target);
         self.render_target_view = render_target_view;
-        self.path_intermediate_texture = path_intermediate_texture;
-        self.path_intermediate_msaa_texture = path_intermediate_msaa_texture;
-        self.path_intermediate_msaa_view = path_intermediate_msaa_view;
-        self.path_intermediate_srv = path_intermediate_srv;
         self.viewport = viewport;
         Ok(())
     }
@@ -1682,28 +1836,14 @@ impl DirectXGlobalElements {
         let global_params_buffer = create_constant_buffer::<GlobalParams>(device)?;
         let batch_params_buffer = create_constant_buffer::<BatchParams>(device)?;
 
-        let sampler = unsafe {
-            let desc = D3D11_SAMPLER_DESC {
-                Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
-                AddressU: D3D11_TEXTURE_ADDRESS_WRAP,
-                AddressV: D3D11_TEXTURE_ADDRESS_WRAP,
-                AddressW: D3D11_TEXTURE_ADDRESS_WRAP,
-                MipLODBias: 0.0,
-                MaxAnisotropy: 1,
-                ComparisonFunc: D3D11_COMPARISON_ALWAYS,
-                BorderColor: [0.0; 4],
-                MinLOD: 0.0,
-                MaxLOD: D3D11_FLOAT32_MAX,
-            };
-            let mut output = None;
-            device.CreateSamplerState(&desc, Some(&mut output))?;
-            output
-        };
+        let sampler = create_sampler(device, D3D11_TEXTURE_ADDRESS_WRAP)?;
+        let filter_sampler = create_sampler(device, D3D11_TEXTURE_ADDRESS_CLAMP)?;
 
         Ok(Self {
             global_params_buffer,
             batch_params_buffer,
             sampler,
+            filter_sampler,
         })
     }
 }
@@ -2036,18 +2176,10 @@ fn create_resources(
 ) -> Result<(
     ID3D11Texture2D,
     Option<ID3D11RenderTargetView>,
-    ID3D11Texture2D,
-    Option<ID3D11ShaderResourceView>,
-    ID3D11Texture2D,
-    Option<ID3D11RenderTargetView>,
     D3D11_VIEWPORT,
 )> {
     let (render_target, render_target_view) =
         create_render_target_and_its_view(swap_chain, &devices.device)?;
-    let (path_intermediate_texture, path_intermediate_srv) =
-        create_path_intermediate_texture(&devices.device, width, height)?;
-    let (path_intermediate_msaa_texture, path_intermediate_msaa_view) =
-        create_path_intermediate_msaa_texture_and_view(&devices.device, width, height)?;
     let viewport = D3D11_VIEWPORT {
         TopLeftX: 0.0,
         TopLeftY: 0.0,
@@ -2056,15 +2188,7 @@ fn create_resources(
         MinDepth: 0.0,
         MaxDepth: 1.0,
     };
-    Ok((
-        render_target,
-        render_target_view,
-        path_intermediate_texture,
-        path_intermediate_srv,
-        path_intermediate_msaa_texture,
-        path_intermediate_msaa_view,
-        viewport,
-    ))
+    Ok((render_target, render_target_view, viewport))
 }
 
 #[inline]
@@ -2924,4 +3048,26 @@ mod dxgi {
             number & 0xFFFF
         ))
     }
+}
+
+/// A linear sampler that treats coordinates outside a texture with `address`.
+fn create_sampler(
+    device: &ID3D11Device,
+    address: D3D11_TEXTURE_ADDRESS_MODE,
+) -> Result<Option<ID3D11SamplerState>> {
+    let desc = D3D11_SAMPLER_DESC {
+        Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+        AddressU: address,
+        AddressV: address,
+        AddressW: address,
+        MipLODBias: 0.0,
+        MaxAnisotropy: 1,
+        ComparisonFunc: D3D11_COMPARISON_ALWAYS,
+        BorderColor: [0.0; 4],
+        MinLOD: 0.0,
+        MaxLOD: D3D11_FLOAT32_MAX,
+    };
+    let mut output = None;
+    unsafe { device.CreateSamplerState(&desc, Some(&mut output))? };
+    Ok(output)
 }

@@ -26,7 +26,16 @@ use metal::{
 use objc::{self, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
 
-use std::{cell::Cell, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc};
+use std::{
+    cell::Cell,
+    ffi::c_void,
+    mem,
+    mem::MaybeUninit,
+    ops::Range,
+    ptr, slice,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -41,6 +50,13 @@ const PATH_SAMPLE_COUNT: u32 = 4;
 /// Metal requires the offset a buffer is bound at to be 256-byte aligned.
 const INSTANCE_BUFFER_ALIGNMENT: usize = 256;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
+const INITIAL_INSTANCE_BUFFER_SIZE: usize = 2 * 1024 * 1024;
+/// How long the instance buffer pool watches its peak use before deciding whether to shrink.
+const INSTANCE_BUFFER_SETTLE: Duration = Duration::from_secs(5);
+/// How long an offscreen target may go unused before its memory is given back. A frame with a
+/// blur, layer or path on screen touches its targets every time, so only targets that nothing
+/// on screen draws through are released.
+const IDLE_RELEASE: Duration = Duration::from_secs(2);
 /// How deeply filtered layers can nest before the innermost ones stop being filtered.
 const LAYER_DEPTH: usize = 4;
 
@@ -60,13 +76,18 @@ pub unsafe fn new_renderer(
 pub struct InstanceBufferPool {
     buffer_size: usize,
     buffers: Vec<metal::Buffer>,
+    /// The most any frame has written since `window` began.
+    peak: usize,
+    window: Instant,
 }
 
 impl Default for InstanceBufferPool {
     fn default() -> Self {
         Self {
-            buffer_size: 2 * 1024 * 1024,
+            buffer_size: INITIAL_INSTANCE_BUFFER_SIZE,
             buffers: Vec::new(),
+            peak: 0,
+            window: Instant::now(),
         }
     }
 }
@@ -110,6 +131,29 @@ impl InstanceBufferPool {
             self.buffers.push(buffer.metal_buffer)
         }
     }
+
+    /// Shrinks the buffers once every frame over the last `INSTANCE_BUFFER_SETTLE` has needed
+    /// under a quarter of one. `used` is what the frame just encoded wrote, and the new size keeps
+    /// twice the peak so the next busy frame does not grow it straight back. Buffers still in
+    /// flight are dropped when they come back, since their size no longer matches.
+    pub(crate) fn settle(&mut self, used: usize) {
+        self.peak = self.peak.max(used);
+        let now = Instant::now();
+        if now.duration_since(self.window) < INSTANCE_BUFFER_SETTLE {
+            return;
+        }
+        let peak = mem::take(&mut self.peak);
+        self.window = now;
+
+        let buffer_size = (peak * 2)
+            .next_power_of_two()
+            .clamp(INITIAL_INSTANCE_BUFFER_SIZE, MAX_INSTANCE_BUFFER_SIZE);
+        if peak * 4 > self.buffer_size || buffer_size >= self.buffer_size {
+            return;
+        }
+        log::info!("decreased instance buffer size to {buffer_size}");
+        self.reset(buffer_size);
+    }
 }
 
 pub struct MetalRenderer {
@@ -142,10 +186,11 @@ pub struct MetalRenderer {
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
-    path_intermediate_texture: Option<metal::Texture>,
-    path_intermediate_msaa_texture: Option<metal::Texture>,
+    path_targets: Option<PathTargets>,
     path_sample_count: u32,
-    filter_targets: Option<FilterTargets>,
+    filter_targets: FilterTargets,
+    /// When the frame being encoded started, which stamps every offscreen target it touches.
+    frame_time: Instant,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "test-support"))]
@@ -445,10 +490,10 @@ impl MetalRenderer {
             instance_buffer_pool,
             sprite_atlas,
             core_video_texture_cache,
-            path_intermediate_texture: None,
-            path_intermediate_msaa_texture: None,
+            path_targets: None,
             path_sample_count: PATH_SAMPLE_COUNT,
-            filter_targets: None,
+            filter_targets: FilterTargets::default(),
+            frame_time: Instant::now(),
             #[cfg(any(test, feature = "test-support"))]
             headless_render_target: None,
         }
@@ -489,44 +534,137 @@ impl MetalRenderer {
                 ];
             }
         }
-        self.update_path_intermediate_textures(size);
+        // Targets made for the old size are freed now rather than held until the next frame
+        // that draws a path or a filter rebuilds them.
+        if self
+            .path_targets
+            .as_ref()
+            .is_some_and(|targets| targets.size != size)
+        {
+            self.path_targets = None;
+        }
+        if self.filter_targets.size != size {
+            self.filter_targets = FilterTargets::default();
+        }
     }
 
-    fn update_path_intermediate_textures(&mut self, size: Size<DevicePixels>) {
+    /// The textures paths are rasterized through at `size`, created if no frame has drawn a
+    /// path at that size since they were last released. None for an empty drawable, which
+    /// happens before the first layout and cannot back a texture.
+    fn path_targets(
+        &mut self,
+        size: Size<DevicePixels>,
+    ) -> Option<(metal::Texture, Option<metal::Texture>)> {
         // We are uncertain when this happens, but sometimes size can be 0 here. Most likely before
         // the layout pass on window creation. Zero-sized texture creation causes SIGABRT.
         // https://github.com/zed-industries/zed/issues/36229
         if size.width.0 <= 0 || size.height.0 <= 0 {
-            self.path_intermediate_texture = None;
-            self.path_intermediate_msaa_texture = None;
-            return;
+            return None;
         }
 
-        let texture_descriptor = metal::TextureDescriptor::new();
-        texture_descriptor.set_width(size.width.0 as u64);
-        texture_descriptor.set_height(size.height.0 as u64);
-        texture_descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
-        texture_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
-        texture_descriptor
-            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
-        self.path_intermediate_texture = Some(self.device.new_texture(&texture_descriptor));
+        if self
+            .path_targets
+            .as_ref()
+            .is_none_or(|targets| targets.size != size)
+        {
+            let texture_descriptor = metal::TextureDescriptor::new();
+            texture_descriptor.set_width(size.width.0 as u64);
+            texture_descriptor.set_height(size.height.0 as u64);
+            texture_descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+            texture_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+            texture_descriptor.set_usage(
+                metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
+            );
+            let intermediate = self.device.new_texture(&texture_descriptor);
 
-        if self.path_sample_count > 1 {
-            // https://developer.apple.com/documentation/metal/choosing-a-resource-storage-mode-for-apple-gpus
-            // Rendering MSAA textures are done in a single pass, so we can use memory-less storage on Apple Silicon
-            let storage_mode = if self.is_apple_gpu {
-                metal::MTLStorageMode::Memoryless
-            } else {
-                metal::MTLStorageMode::Private
+            let msaa = (self.path_sample_count > 1).then(|| {
+                // https://developer.apple.com/documentation/metal/choosing-a-resource-storage-mode-for-apple-gpus
+                // Rendering MSAA textures are done in a single pass, so we can use memory-less storage on Apple Silicon
+                let storage_mode = if self.is_apple_gpu {
+                    metal::MTLStorageMode::Memoryless
+                } else {
+                    metal::MTLStorageMode::Private
+                };
+
+                let msaa_descriptor = texture_descriptor;
+                msaa_descriptor.set_texture_type(metal::MTLTextureType::D2Multisample);
+                msaa_descriptor.set_storage_mode(storage_mode);
+                msaa_descriptor.set_sample_count(self.path_sample_count as _);
+                self.device.new_texture(&msaa_descriptor)
+            });
+
+            self.path_targets = Some(PathTargets {
+                size,
+                intermediate,
+                msaa,
+                used: self.frame_time,
+            });
+        }
+
+        let targets = self.path_targets.as_mut()?;
+        targets.used = self.frame_time;
+        Some((targets.intermediate.clone(), targets.msaa.clone()))
+    }
+
+    /// One filter target for a drawable of `viewport_size`, created if no frame has drawn
+    /// through it at that size since it was last released.
+    fn filter_texture(
+        &mut self,
+        target: FilterTarget,
+        viewport_size: Size<DevicePixels>,
+    ) -> metal::Texture {
+        if self.filter_targets.size != viewport_size {
+            self.filter_targets = FilterTargets {
+                size: viewport_size,
+                ..FilterTargets::default()
             };
+        }
+        let shrink = target.shrink() as u64;
+        let width = (i32::from(viewport_size.width).max(1) as u64 / shrink).max(1);
+        let height = (i32::from(viewport_size.height).max(1) as u64 / shrink).max(1);
+        let now = self.frame_time;
+        let device = &self.device;
+        let scratch = self.filter_targets.slot(target).get_or_insert_with(|| {
+            let descriptor = metal::TextureDescriptor::new();
+            descriptor.set_texture_type(metal::MTLTextureType::D2);
+            descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+            descriptor.set_width(width);
+            descriptor.set_height(height);
+            descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+            descriptor.set_usage(
+                metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
+            );
+            Scratch {
+                texture: device.new_texture(&descriptor),
+                used: now,
+            }
+        });
+        scratch.used = now;
+        scratch.texture.clone()
+    }
 
-            let msaa_descriptor = texture_descriptor;
-            msaa_descriptor.set_texture_type(metal::MTLTextureType::D2Multisample);
-            msaa_descriptor.set_storage_mode(storage_mode);
-            msaa_descriptor.set_sample_count(self.path_sample_count as _);
-            self.path_intermediate_msaa_texture = Some(self.device.new_texture(&msaa_descriptor));
-        } else {
-            self.path_intermediate_msaa_texture = None;
+    /// Frees offscreen targets that no frame has drawn through for `IDLE_RELEASE`. Every frame
+    /// checks this itself, so a caller only needs it for a window that has stopped drawing.
+    pub fn release_idle_targets(&mut self) {
+        self.release_targets_idle_at(Instant::now());
+    }
+
+    /// Drops every offscreen target that no frame has drawn through within `IDLE_RELEASE` of
+    /// `now`. A command buffer retains what it encodes, so a target an earlier frame still uses
+    /// on the GPU stays alive until that frame completes.
+    fn release_targets_idle_at(&mut self, now: Instant) {
+        let idle = |used: Instant| now.duration_since(used) >= IDLE_RELEASE;
+        if self
+            .path_targets
+            .as_ref()
+            .is_some_and(|targets| idle(targets.used))
+        {
+            self.path_targets = None;
+        }
+        for slot in self.filter_targets.slots() {
+            if slot.as_ref().is_some_and(|scratch| idle(scratch.used)) {
+                *slot = None;
+            }
         }
     }
 
@@ -616,7 +754,9 @@ impl MetalRenderer {
         )?;
 
         let instance_buffer_pool = self.instance_buffer_pool.clone();
+        let used = writer.offset;
         let instance_buffer = Cell::new(Some(writer.finish()));
+        instance_buffer_pool.lock().settle(used);
         let block = ConcreteBlock::new(move |_| {
             if let Some(instance_buffer) = instance_buffer.take() {
                 instance_buffer_pool.lock().release(instance_buffer);
@@ -672,9 +812,6 @@ impl MetalRenderer {
             anyhow::bail!("Invalid size for render_scene_to_image: {:?}", size);
         }
 
-        // Update path intermediate textures for this size
-        self.update_path_intermediate_textures(size);
-
         // Create an offscreen texture as render target
         let texture_descriptor = metal::TextureDescriptor::new();
         texture_descriptor.set_width(size.width.0 as u64);
@@ -716,8 +853,6 @@ impl MetalRenderer {
             anyhow::bail!("Invalid size for render_scene: {:?}", size);
         }
 
-        self.update_path_intermediate_textures(size);
-
         let needs_new_target = self.headless_render_target.as_ref().is_none_or(|texture| {
             texture.width() != size.width.0 as u64 || texture.height() != size.height.0 as u64
         });
@@ -753,24 +888,23 @@ impl MetalRenderer {
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
     ) -> Result<metal::CommandBuffer> {
+        self.frame_time = Instant::now();
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
         let alpha = if self.opaque { 1. } else { 0. };
         let filtered =
             filters_enabled() && (!scene.effects.is_empty() || !scene.backdrops.is_empty());
-        let targets = filtered.then(|| self.filter_targets(viewport_size));
         // Backdrops read what the frame has drawn so far, which a drawable cannot be sampled from,
         // so a frame carrying them is drawn offscreen and blitted back at the end.
-        let mirrored = !scene.backdrops.is_empty();
-        let held = targets.as_ref();
-        let main_texture: &metal::TextureRef = match (held, mirrored) {
-            (Some(held), true) => &held.frame,
-            _ => texture,
+        let mirrored = filtered && !scene.backdrops.is_empty();
+        let main_texture = match mirrored {
+            true => self.filter_texture(FilterTarget::Frame, viewport_size),
+            false => texture.to_owned(),
         };
 
         let mut command_encoder = new_command_encoder_for_texture(
             command_buffer,
-            main_texture,
+            &main_texture,
             viewport_size,
             Some(metal::MTLClearColor::new(0., 0., 0., alpha)),
         );
@@ -781,8 +915,9 @@ impl MetalRenderer {
         let mut spans: Vec<Bounds<ScaledPixels>> = Vec::new();
 
         for batch in scene.batches() {
-            let wanted = held
-                .and_then(|_| scene.filtered(scene.batch_order(&batch)))
+            let wanted = filtered
+                .then(|| scene.filtered(scene.batch_order(&batch)))
+                .flatten()
                 .map(|index| scene.filter_chain(index))
                 .unwrap_or_default();
             let shared = stack
@@ -809,44 +944,34 @@ impl MetalRenderer {
                 }
 
                 let index = stack.pop().expect("the stack is not empty");
-                let held = held.expect("a filtered layer implies its targets");
                 let layer = scene.effects[index];
                 let clip = spans.pop().unwrap_or_else(|| layer.destination_clip());
-                let source: &metal::TextureRef = &held.layers[stack.len().min(LAYER_DEPTH - 1)];
-                let onto: &metal::TextureRef = match stack.last() {
-                    Some(_) => &held.layers[(stack.len() - 1).min(LAYER_DEPTH - 1)],
-                    None => main_texture,
-                };
 
                 command_encoder.end_encoding();
-                let blurred = match layer.filter.blurs() {
-                    true => self.blur_source(
-                        held,
-                        command_buffer,
-                        source,
-                        layer.filter.blur,
-                        Some(layer.blur_bounds(clip)),
-                        viewport_size,
-                    ),
-                    false => source,
-                };
-                self.composite_layer(command_buffer, blurred, onto, layer, clip, viewport_size);
+                let onto = self.close_layer(
+                    command_buffer,
+                    layer,
+                    clip,
+                    stack.len(),
+                    &main_texture,
+                    viewport_size,
+                );
                 command_encoder =
-                    new_command_encoder_for_texture(command_buffer, onto, viewport_size, None);
+                    new_command_encoder_for_texture(command_buffer, &onto, viewport_size, None);
             }
 
             for index in wanted.iter().skip(shared + usize::from(merged)) {
                 if stack.len() >= LAYER_DEPTH {
                     break;
                 }
-                let held = held.expect("a filtered layer implies its targets");
                 let layer = scene.effects[*index];
                 let depth = stack.len();
 
                 command_encoder.end_encoding();
+                let target = self.filter_texture(FilterTarget::Layer(depth), viewport_size);
                 command_encoder = new_command_encoder_for_texture(
                     command_buffer,
-                    &held.layers[depth],
+                    &target,
                     viewport_size,
                     Some(metal::MTLClearColor::new(0., 0., 0., 0.)),
                 );
@@ -863,29 +988,47 @@ impl MetalRenderer {
                 }
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
-                    let onto = open_target(&stack, held, main_texture);
+                    // The texture the frame is drawing into right now: the innermost open
+                    // layer, or the frame itself.
+                    let onto = match stack.len().checked_sub(1) {
+                        Some(depth) => self.filter_texture(
+                            FilterTarget::Layer(depth.min(LAYER_DEPTH - 1)),
+                            viewport_size,
+                        ),
+                        None => main_texture.clone(),
+                    };
                     command_encoder.end_encoding();
 
-                    let did_draw = self.draw_paths_to_intermediate(
-                        paths,
-                        writer,
-                        viewport_size,
-                        command_buffer,
-                    )?;
+                    let targets = match paths.is_empty() {
+                        true => None,
+                        false => self.path_targets(viewport_size),
+                    };
+                    let did_draw = match &targets {
+                        Some((intermediate, msaa)) => self.draw_paths_to_intermediate(
+                            paths,
+                            writer,
+                            viewport_size,
+                            command_buffer,
+                            intermediate,
+                            msaa.as_deref(),
+                        )?,
+                        None => false,
+                    };
 
                     command_encoder =
-                        new_command_encoder_for_texture(command_buffer, onto, viewport_size, None);
+                        new_command_encoder_for_texture(command_buffer, &onto, viewport_size, None);
 
-                    if did_draw {
-                        if let Err(error) = self.draw_paths_from_intermediate(
+                    if let Some((intermediate, _)) = targets.filter(|_| did_draw)
+                        && let Err(error) = self.draw_paths_from_intermediate(
                             paths,
                             writer,
                             viewport_size,
                             command_encoder,
-                        ) {
-                            command_encoder.end_encoding();
-                            return Err(error);
-                        }
+                            &intermediate,
+                        )
+                    {
+                        command_encoder.end_encoding();
+                        return Err(error);
                     }
                 }
                 PrimitiveBatch::Underlines(range) => {
@@ -908,9 +1051,9 @@ impl MetalRenderer {
                         command_encoder,
                     ),
                 PrimitiveBatch::Backdrops(range) => {
-                    let Some(held) = held.filter(|_| stack.is_empty()) else {
+                    if !filtered || !stack.is_empty() {
                         continue;
-                    };
+                    }
                     let backdrops = &scene.backdrops[range.clone()];
                     let sigma = backdrops
                         .iter()
@@ -925,23 +1068,23 @@ impl MetalRenderer {
 
                     command_encoder.end_encoding();
                     let blurred = self.blur_source(
-                        held,
                         command_buffer,
-                        &held.frame,
+                        &main_texture,
+                        false,
                         sigma,
                         clip,
                         viewport_size,
                     );
                     command_encoder = new_command_encoder_for_texture(
                         command_buffer,
-                        main_texture,
+                        &main_texture,
                         viewport_size,
                         None,
                     );
                     self.draw_backdrops(
                         range,
                         instance_bindings,
-                        blurred,
+                        &blurred,
                         viewport_size,
                         command_encoder,
                     );
@@ -958,84 +1101,76 @@ impl MetalRenderer {
         }
 
         while let Some(index) = stack.pop() {
-            let held = held.expect("a filtered layer implies its targets");
             let layer = scene.effects[index];
             let clip = spans.pop().unwrap_or_else(|| layer.destination_clip());
-            let source: &metal::TextureRef = &held.layers[stack.len().min(LAYER_DEPTH - 1)];
-            let onto: &metal::TextureRef = match stack.last() {
-                Some(_) => &held.layers[(stack.len() - 1).min(LAYER_DEPTH - 1)],
-                None => main_texture,
-            };
 
             command_encoder.end_encoding();
-            let blurred = match layer.filter.blurs() {
-                true => self.blur_source(
-                    held,
-                    command_buffer,
-                    source,
-                    layer.filter.blur,
-                    Some(layer.blur_bounds(clip)),
-                    viewport_size,
-                ),
-                false => source,
-            };
-            self.composite_layer(command_buffer, blurred, onto, layer, clip, viewport_size);
+            let onto = self.close_layer(
+                command_buffer,
+                layer,
+                clip,
+                stack.len(),
+                &main_texture,
+                viewport_size,
+            );
             command_encoder =
-                new_command_encoder_for_texture(command_buffer, onto, viewport_size, None);
+                new_command_encoder_for_texture(command_buffer, &onto, viewport_size, None);
         }
 
         command_encoder.end_encoding();
 
-        if let Some(held) = held.filter(|_| mirrored) {
+        if mirrored {
             self.filter_pass(
                 command_buffer,
                 &self.blit_pipeline_state,
-                &held.frame,
+                &main_texture,
                 texture,
                 None,
                 None,
             );
         }
 
+        self.release_targets_idle_at(self.frame_time);
+
         Ok(command_buffer.to_owned())
     }
 
-    /// The targets the frame blurs and masks through, rebuilt whenever the viewport changes.
-    fn filter_targets(&mut self, viewport_size: Size<DevicePixels>) -> FilterTargets {
-        let stale = self
-            .filter_targets
-            .as_ref()
-            .is_none_or(|targets| targets.size != viewport_size);
-        if stale {
-            let width = i32::from(viewport_size.width).max(1) as u64;
-            let height = i32::from(viewport_size.height).max(1) as u64;
-            let target = |width: u64, height: u64| {
-                let descriptor = metal::TextureDescriptor::new();
-                descriptor.set_texture_type(metal::MTLTextureType::D2);
-                descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
-                descriptor.set_width(width.max(1));
-                descriptor.set_height(height.max(1));
-                descriptor.set_storage_mode(metal::MTLStorageMode::Private);
-                descriptor.set_usage(
-                    metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
-                );
-                self.device.new_texture(&descriptor)
-            };
-
-            self.filter_targets = Some(FilterTargets {
-                size: viewport_size,
-                frame: target(width, height),
-                layers: (0..LAYER_DEPTH).map(|_| target(width, height)).collect(),
-                levels: (0..=KAWASE_LEVELS)
-                    .map(|level| target(width >> level, height >> level))
-                    .collect(),
-                scratch: target(width, height),
-            });
-        }
-
-        self.filter_targets
-            .clone()
-            .expect("the targets were just built")
+    /// Blurs a filtered layer that has just closed, when its filter asks for a blur, composites
+    /// it into its parent and returns the parent, so the caller can resume drawing there.
+    /// `depth` is the closed layer's own nesting depth.
+    fn close_layer(
+        &mut self,
+        command_buffer: &metal::CommandBufferRef,
+        layer: LayerEffect,
+        clip: Bounds<ScaledPixels>,
+        depth: usize,
+        main_texture: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+    ) -> metal::Texture {
+        let source = self.filter_texture(
+            FilterTarget::Layer(depth.min(LAYER_DEPTH - 1)),
+            viewport_size,
+        );
+        let onto = match depth.checked_sub(1) {
+            Some(parent) => self.filter_texture(
+                FilterTarget::Layer(parent.min(LAYER_DEPTH - 1)),
+                viewport_size,
+            ),
+            None => main_texture.to_owned(),
+        };
+        let blurred = match layer.filter.blurs() {
+            true => self.blur_source(
+                command_buffer,
+                &source,
+                true,
+                layer.filter.blur,
+                Some(layer.blur_bounds(clip)),
+                viewport_size,
+            ),
+            false => source,
+        };
+        self.composite_layer(command_buffer, &blurred, &onto, layer, clip, viewport_size);
+        onto
     }
 
     /// Clamps a region to the target it is drawn into, shrunk to the blur step it runs at.
@@ -1105,38 +1240,39 @@ impl MetalRenderer {
 
     /// Blurs a source and returns the target holding the result. A narrow blur comes back at
     /// full size, a wide one at the level [`Kawase::settled`] names, and whatever samples it
-    /// stretches it back up.
-    fn blur_source<'a>(
-        &self,
-        targets: &'a FilterTargets,
+    /// stretches it back up. A `spare` source is a layer nothing reads again, so a gaussian
+    /// writes its result back into it rather than into a full-size target of its own.
+    fn blur_source(
+        &mut self,
         command_buffer: &metal::CommandBufferRef,
-        source: &'a metal::TextureRef,
+        source: &metal::TextureRef,
+        spare: bool,
         sigma: f32,
         clip: Option<Bounds<ScaledPixels>>,
         viewport_size: Size<DevicePixels>,
-    ) -> &'a metal::TextureRef {
+    ) -> metal::Texture {
         match BlurPasses::for_sigma(sigma) {
             BlurPasses::Gaussian(sigma) => {
-                self.gaussian_blur(targets, command_buffer, source, sigma, clip, viewport_size)
+                self.gaussian_blur(command_buffer, source, spare, sigma, clip, viewport_size)
             }
             BlurPasses::Kawase(kawase) => {
-                self.kawase_blur(targets, command_buffer, source, kawase, clip, viewport_size)
+                self.kawase_blur(command_buffer, source, kawase, clip, viewport_size)
             }
         }
     }
 
-    /// Blurs a source across into the scratch target and down into level zero, both at full
-    /// size. The pass across covers the clip grown by the kernel, since the pass down reads that
-    /// far above and below it.
-    fn gaussian_blur<'a>(
-        &self,
-        targets: &'a FilterTargets,
+    /// Blurs a source across into the scratch target and down into level zero, or back into a
+    /// `spare` source, both at full size. The pass across covers the clip grown by the kernel,
+    /// since the pass down reads that far above and below it.
+    fn gaussian_blur(
+        &mut self,
         command_buffer: &metal::CommandBufferRef,
-        source: &'a metal::TextureRef,
+        source: &metal::TextureRef,
+        spare: bool,
         sigma: f32,
         clip: Option<Bounds<ScaledPixels>>,
         viewport_size: Size<DevicePixels>,
-    ) -> &'a metal::TextureRef {
+    ) -> metal::Texture {
         let across = BlurParams {
             direction: [1., 0.],
             radius: sigma,
@@ -1147,25 +1283,29 @@ impl MetalRenderer {
             radius: sigma,
             pad: 0.,
         };
+        let scratch = self.filter_texture(FilterTarget::Scratch, viewport_size);
+        let settled = match spare {
+            true => source.to_owned(),
+            false => self.filter_texture(FilterTarget::Level(0), viewport_size),
+        };
         let within = |margin: f32| {
             clip.and_then(|clip| Self::scissor(clip.dilate(ScaledPixels(margin)), viewport_size, 1))
         };
         let reach = (sigma * GAUSSIAN_REACH).ceil() + 1.;
 
-        let settled: &metal::TextureRef = &targets.levels[0];
         self.filter_pass(
             command_buffer,
             &self.gaussian_pipeline_state,
             source,
-            &targets.scratch,
+            &scratch,
             Some(&across),
             within(reach),
         );
         self.filter_pass(
             command_buffer,
             &self.gaussian_pipeline_state,
-            &targets.scratch,
-            settled,
+            &scratch,
+            &settled,
             Some(&down),
             within(1.),
         );
@@ -1173,20 +1313,22 @@ impl MetalRenderer {
     }
 
     /// Blurs a source with a dual Kawase blur and returns the level it settled at.
-    fn kawase_blur<'a>(
-        &self,
-        targets: &'a FilterTargets,
+    fn kawase_blur(
+        &mut self,
         command_buffer: &metal::CommandBufferRef,
-        source: &'a metal::TextureRef,
+        source: &metal::TextureRef,
         kawase: Kawase,
         clip: Option<Bounds<ScaledPixels>>,
         viewport_size: Size<DevicePixels>,
-    ) -> &'a metal::TextureRef {
+    ) -> metal::Texture {
         let params = BlurParams {
             direction: [0., 0.],
             radius: kawase.offset,
             pad: 0.,
         };
+        let levels: Vec<metal::Texture> = (1..=kawase.levels)
+            .map(|level| self.filter_texture(FilterTarget::Level(level), viewport_size))
+            .collect();
         // Every pass covers the clip grown by what all the passes together read, which is at
         // least what the ones after it still need. A texel more keeps the bilinear taps on the
         // clip's own edge off texels nothing has written.
@@ -1197,9 +1339,8 @@ impl MetalRenderer {
             clip.and_then(|clip| Self::scissor(clip.dilate(grown), viewport_size, shrink))
         };
 
-        let mut from = source;
-        for level in 1..=kawase.levels {
-            let to: &metal::TextureRef = &targets.levels[level];
+        let mut from: &metal::TextureRef = source;
+        for (level, to) in (1..).zip(&levels) {
             self.filter_pass(
                 command_buffer,
                 &self.kawase_down_pipeline_state,
@@ -1210,7 +1351,7 @@ impl MetalRenderer {
             );
             from = to;
         }
-        let settled: &metal::TextureRef = &targets.levels[kawase.settled];
+        let settled = &levels[kawase.settled - 1];
         self.filter_pass(
             command_buffer,
             &self.kawase_up_pipeline_state,
@@ -1219,7 +1360,7 @@ impl MetalRenderer {
             Some(&params),
             within(kawase.settled),
         );
-        settled
+        settled.clone()
     }
 
     /// Draws a filtered layer back into its parent, clipped to the layer's bounds.
@@ -1323,14 +1464,12 @@ impl MetalRenderer {
         writer: &mut InstanceBufferWriter,
         viewport_size: Size<DevicePixels>,
         command_buffer: &metal::CommandBufferRef,
+        intermediate_texture: &metal::TextureRef,
+        msaa_texture: Option<&metal::TextureRef>,
     ) -> Result<bool> {
         if paths.is_empty() {
             return Ok(false);
         }
-        let intermediate_texture = self
-            .path_intermediate_texture
-            .as_ref()
-            .context("missing path intermediate texture")?;
 
         let mut vertices = Vec::new();
         for path in paths {
@@ -1351,7 +1490,7 @@ impl MetalRenderer {
         color_attachment.set_load_action(metal::MTLLoadAction::Clear);
         color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., 0.));
 
-        if let Some(msaa_texture) = &self.path_intermediate_msaa_texture {
+        if let Some(msaa_texture) = msaa_texture {
             color_attachment.set_texture(Some(msaa_texture));
             color_attachment.set_resolve_texture(Some(intermediate_texture));
             color_attachment.set_store_action(metal::MTLStoreAction::MultisampleResolve);
@@ -1477,14 +1616,11 @@ impl MetalRenderer {
         writer: &mut InstanceBufferWriter,
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
+        intermediate_texture: &metal::TextureRef,
     ) -> Result<()> {
         let Some(first_path) = paths.first() else {
             return Ok(());
         };
-        let intermediate_texture = self
-            .path_intermediate_texture
-            .as_ref()
-            .context("missing path intermediate texture")?;
 
         command_encoder.set_render_pipeline_state(&self.path_sprites_pipeline_state);
         command_encoder.set_vertex_buffer(
@@ -1788,21 +1924,11 @@ fn filters_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("GPUI_FILTERS").as_deref() != Ok("0"))
 }
 
-/// The texture the frame is drawing into right now: the innermost open layer, or the frame itself.
-fn open_target<'a>(
-    stack: &[usize],
-    held: Option<&'a FilterTargets>,
-    frame: &'a metal::TextureRef,
-) -> &'a metal::TextureRef {
-    match (stack.len().checked_sub(1), held) {
-        (Some(depth), Some(held)) => &held.layers[depth.min(LAYER_DEPTH - 1)],
-        _ => frame,
-    }
-}
-
+/// Starts a render pass into `texture`. The pass descriptor retains the texture, so it may be a
+/// temporary the caller drops before the encoder ends.
 fn new_command_encoder_for_texture<'a>(
     command_buffer: &'a metal::CommandBufferRef,
-    texture: &'a metal::TextureRef,
+    texture: &metal::TextureRef,
     viewport_size: Size<DevicePixels>,
     clear_color: Option<metal::MTLClearColor>,
 ) -> &'a metal::RenderCommandEncoderRef {
@@ -1862,17 +1988,75 @@ fn read_texture_to_image(texture: &metal::TextureRef) -> Result<RgbaImage> {
     RgbaImage::from_raw(width, height, pixels).context("failed to create RgbaImage from pixel data")
 }
 
-/// Offscreen targets a frame needs to blur and mask what it has drawn.
-#[derive(Clone)]
+/// An offscreen target created the first time a frame needs it and released once it has gone
+/// `IDLE_RELEASE` without use.
+struct Scratch {
+    texture: metal::Texture,
+    used: Instant,
+}
+
+/// One of the offscreen targets filters draw through.
+#[derive(Clone, Copy)]
+enum FilterTarget {
+    /// The frame itself, drawn offscreen so a backdrop can sample what lies under it.
+    Frame,
+    /// The target a filtered layer is drawn into, by nesting depth.
+    Layer(usize),
+    /// One blur level, the frame's size halved as many times as its index. Level zero holds a
+    /// finished gaussian.
+    Level(usize),
+    /// Where a gaussian keeps its pass across before the pass down.
+    Scratch,
+}
+
+impl FilterTarget {
+    /// How many times smaller than the frame the target is on each side.
+    fn shrink(self) -> u32 {
+        match self {
+            Self::Level(level) => 1 << level,
+            Self::Frame | Self::Layer(_) | Self::Scratch => 1,
+        }
+    }
+}
+
+/// Offscreen targets a frame needs to blur and mask what it has drawn, all made for one
+/// drawable size. Each one is allocated the first time a frame draws through it, so a frame
+/// with one shallow blur pays for the targets it touches rather than for every depth and level.
+#[derive(Default)]
 struct FilterTargets {
     size: Size<DevicePixels>,
-    frame: metal::Texture,
-    layers: Vec<metal::Texture>,
-    /// One target per blur level, the frame's size halved as many times as its index. Level zero
-    /// holds a finished gaussian.
-    levels: Vec<metal::Texture>,
-    /// Where a gaussian keeps its pass across before the pass down.
-    scratch: metal::Texture,
+    frame: Option<Scratch>,
+    layers: [Option<Scratch>; LAYER_DEPTH],
+    levels: [Option<Scratch>; KAWASE_LEVELS + 1],
+    scratch: Option<Scratch>,
+}
+
+impl FilterTargets {
+    fn slot(&mut self, target: FilterTarget) -> &mut Option<Scratch> {
+        match target {
+            FilterTarget::Frame => &mut self.frame,
+            FilterTarget::Layer(depth) => &mut self.layers[depth],
+            FilterTarget::Level(level) => &mut self.levels[level],
+            FilterTarget::Scratch => &mut self.scratch,
+        }
+    }
+
+    fn slots(&mut self) -> impl Iterator<Item = &mut Option<Scratch>> {
+        std::iter::once(&mut self.frame)
+            .chain(self.layers.iter_mut())
+            .chain(self.levels.iter_mut())
+            .chain(std::iter::once(&mut self.scratch))
+    }
+}
+
+/// The textures paths are rasterized through, made for one drawable size.
+struct PathTargets {
+    size: Size<DevicePixels>,
+    intermediate: metal::Texture,
+    /// The multisampled target paths are rasterized into and resolved from. Memoryless on
+    /// Apple GPUs, so it only costs memory on Intel Macs.
+    msaa: Option<metal::Texture>,
+    used: Instant,
 }
 
 #[repr(C)]
